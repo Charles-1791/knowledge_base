@@ -54,6 +54,31 @@ An optimized Plan tree looks like:
 
 <img src="../images/pm_introduction_complex_after.jpg" alt="Plan Tree" width="65%"/>
 
-## Algorithm Walkthrough
-### A Common Pitfall
-Deriving as many predicate as possible may not be a good practice.
+### Recognizing Redundant Predicates
+Deriving as many predicate as possible is not always beneficial. Considering the following query:
+
+```SQL
+SELECT *
+FROM (
+    SELECT id1, id2 
+    FROM t1, t2
+    WHERE id1 = id2
+    ) temp1 JOIN t3 ON id1 = id3
+```
+
+It is easy to infer that `id1 = id2 = id3`, but adding an extra  predicate like `id2 = id3` does not improve performance - in fact, it can slow down execution due to increased computational overhead or redundant checks.
+
+We consider a newly derived predicate P to be `redundant` if it can be inferred from the set of all predicates already present in the subtree rooted at the lowest plan node N to which P can be pushed.
+
+Our algorithm
+
+## An Overview of Logical Plan Nodes
+[Logical Plan Node](../architecture/logical_plan_node.md)
+
+## Algorithm Implementation
+Different from the regular practice in papers, where a closure of predicates is generated, my approach is to 'deduce only when you have to' - we do not generate predicates as much as possible(predicate closure) and eliminate redundancy afterwards. Instead, only meaningful and pushable predicates are deduced.
+
+### Data Structure
+
+
+
