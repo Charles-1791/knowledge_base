@@ -1,0 +1,2 @@
+# Contents
+This directory contains my personal developing notes of a distributed database kernel. To better understand them, it is highly recommended to read this notes [Basic Architecture](architecture/basic_arch.md) first. 
