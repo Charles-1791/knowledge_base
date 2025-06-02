@@ -36,3 +36,4 @@ We generate such plan tree:
 
 <img src="../images/lpn_cs_1.jpg" alt="Plan Tree" width="60%"/>
 
+As shown above, a logical plan node can only build new columns based on the ones it receive from children. The Projection, for example, generates two new columns `#7` and `#8` based on column `#1`, `#4` and `#5` returned by the Selection Node below. Moreover, some columns are deliberately pruned as they are not required, like `#1,#3,#4,#5,#6`. In fact, most databases have an optimizer called `Column Pruner`, which is specifically design to remove unnecessary columns returned by plan nodes. 
