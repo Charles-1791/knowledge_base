@@ -28,10 +28,10 @@
 
 consider them as pointers 
 - pointer
-- slice
-- map
-- function
-- channel 
+- slice (not comparable)
+- map (not comparable)
+- function (not comparable)
+- channel (not comparable)
 
 ### interface types
 - interface
@@ -324,3 +324,64 @@ int main() {
 
 ## fmt.Print
 If a struct only has a String() method with pointer receiver, call fmt.Print() for an instance(not pointer) of such struct wouldn't trigger the String() unless we call in this way: fmt.Printf(&x).
+
+In fact, adding a String() method to some struct/type makes it implement an interface called fmt.Stringer:
+
+```golang
+package fmt
+type Stringer interface {
+	String() string
+}
+```
+
+## Forcing Inheritance
+In golang, there is no key words like `extends` or `implements`, but we can use the following norm to ask compiler to check the inheritance relationship.
+
+Assuming we have a interface named Foo, and we need to force a struct Bar to satisfy it, we can write:
+
+```golang
+var  _ Foo = (*Bar)(nil)
+```
+
+## Interface
+### Comparing two interface
+Two interface values `a` and `b` are comparable using == or != if:
+- They hold the same dynamic type
+
+- The underlying dynamic values are comparable
+
+**Panic danger**:
+
+If the dynamic value is not comparable, comparing interfaces will panic at runtime. `Maps`, `slices`, and `functions` are not comparable. Comparing them directly using `==` or `!=` can be detected by compiler, but wrapping them in interfaces and comparing will panic.
+
+### Comparing with nil
+An interface has two component under the hood:
+- Type: the dynamic type of the value stored.
+
+- Value: the actual dynamic value.
+
+An instance is nil only when both of them are nil. In other words, it is not pointing to a variable or an instance.
+
+```golang
+type Foo struct {
+	val int
+}
+
+func (f *Foo) Val() int {
+	return f.val
+}
+
+type ValGetter interface {
+	Val() int
+} 
+
+func main() {
+	var it ValGetter 
+	fmt.Println(it == nil) // true
+	var foo *Foo = nil
+	it = foo
+	fmt.Println(it == nil) // false
+}
+```
+
+

@@ -115,13 +115,51 @@ where the $ are placeholders -- `$0` stands for the first equivalent set, `$1` s
 
 
 ### Two Phases
-Predicate Move Around is implemented in two steps -- predicate pull up and push down.
+Predicate Move Around is implemented in two steps -- predicate pull up and push down. 
+
+#### Pull Up
 
 <img src="../images/pm_tp_1.jpg" alt="Plan Tree" width="65%"/>
 
 In the pull up phase, every node(except the table scan) receives from its child a `PredicateSummary`, which is processed differently according to the nature of the node to generate a new `PredicateSummary`. The newly generated summary is then returned to its father node, where further modifications are made. Similar to a bubble rising to the water surface, one by one, the `PredicateSummary` ascends from the leaves to the root.
 
+Our pull up interface looks like:
+
+```c++ 
+struct Pullable {
+    virtual PredicateSummary* PullUp() = 0;  
+}
+
+class SomeNode : public Pullable {
+    PredicateSummary* PullUp() {
+        PredicateSummary* child_summary = this->child->PullUp();
+        // modify the summary based on its own information
+        this->ModifySummary(child_summary);
+        // after modification
+        return child_summary;
+    }  
+}
+```
+
+#### Push Down
+
 The push down phase begins upon the finish of the pull up phase. The summary returned by root now traverses down from root to leaves. While permeating through a node, the summary changes accordingly. Meanwhile, some new predicates may be generated and are attached to the node. When a summary reaches the leaf nodes, which are usually Table Scans, it 'flattens' itself into a group of predicates and becomes a `Selection` Node, hanging just above the leaves.
+
+```c++ 
+struct Pushable {
+    virtual void PushDown(PredicateSummary*) = 0;  
+}
+
+class SomeNode : public Pushable {
+    void PushDown(PredicateSummary* parent_summary) {
+        // modify the summary based on its own information
+        this->ModifySummary(&parent_summary);
+        // after modification
+        PushDown(this->child);
+    }  
+}
+```
+
 
 For a certain plan node, if we name as `summary_up` the predicate summary returned by it during pull up phase, and `summary_down` the summary it receives from its father during push down phase, it's always true that `summary_up <= summary_down`. In other words, the `summary_down` always contains more "knowledge" or "information" than `summary_up`. 
 
@@ -149,6 +187,113 @@ Since `conditions` contains predicates that can be used directly, we can add the
 PS: A better practice would be converting predicates into new conditions more 'favored' by database through substituting columns. After replacing column with an indexed(and equivalent) one, a new predicate usually outperforms the original one thanks to the more efficient index scan. 
 
 #### Selection
+##### Pull up
+As a `filter node`, a `Selection` has one or multiple predicates, which are connected with `AND`. We check if each of them owns the form `col1 = col2`. If so, we consider them equivalent and merge their corresponding equivalent sets in the `PredicateSummary` returned from the child node (if they belong to different ones). Otherwise, such predicate is added directly to the `condition` member.
+
+<img src="../images/pm_selection_pu.jpg" alt="Plan Tree" width="80%"/>
+
+##### Push Down
+The only thing we need to do is to delete the Selection node. During the pull-up phase, all relevant information was stored in `PredicateSummary`, referred to as `summary_up`. Now, the summary received from the parent node, `summary_down`, contains at least as much information as `summary_up`. Therefore, the Selection node provides no additional value and can be considered redundant.
+
+<img src="../images/pm_selection_pd.jpg" alt="Plan Tree" width="80%"/>
+
+#### Projection
+A projection node removes unwanted columns and does computation over several columns to generate new columns. It corresponds to the `SELECT` clause. For instance:
+
+If a table foo has four columns, `a, b, c, d`, the for query
+```SQL
+SELECT a + b, c as cc
+FROM foo
+```
+Project computes the sum of column `a` and `b`, renames column `c` `cc` and removes the unwanted column `d`.
+
+Define the columns returned by child as `input` and columns returned by projection `output`, we classify a column into three categories:
+
+- Survivors: columns appear in both input and output
+- Victims: columns appear in input but not output
+- Newcomers: columns appear in output but not input
+
+<img src="../images/pm_projection_3categories.jpg" alt="Plan Tree" width="35%"/>
+
+For example, in the image above, we have:
+| category | columns|
+-----------|---------
+|survivors | #2, #4 |
+| victims | #1, #3, #5 |
+| newcomers | #6 |
+
+##### Pull Up
+Since node must return a summary containing only the columns returned by itself, we need to pay special attention to `Victims`, columns cannot appear in the returning summary.
+
+Let's look at `equalSets` first. If a victim appears in some set with more than one element, such equal relation is lost if we directly remove victims from that set - there's no way to add them back in push down phase. 
+
+<img src="../images/pm_projection_pu.jpg" alt="Plan Tree" width="50%"/>
+
+Take the picture as an example, in the child summary, we have an equivalent set `{#1, #2, #3}`. If we just remove `#1` and `#3`, when we do push down, there is no way to recover `#1 = #2 = #3`. Therefore, we need to save the equivalent set in a buffer before filtering out the victims.
+
+```
+for eqSet in childSummary.equalSets:
+    if eqSet contains victims:
+        eqSet.copy() -> node.buffer
+        eqSet -= victims
+```
+
+Similarly, a predicate in `conditions` which contains victims cannot be easily removed. Instead, we try to infer an equivalent one if possible in that we hope to "report" as much information as possible. The first predicate in the image is `#1 + #2 = 25`. Since `#1` is a victim, we cannot keep it in `conditions`. However, we have `#1 = #2`, from which infer `#2 + #2 = 25`, a new condition containing only survivors and is therefore safe to be returned by Projection. We fail to deduce a new predicate from the second predicate `#4 + #5 = 100`, so it should be sended to buffer.
+
+After pull up, the summary and buffer looks like:
+
+<img src="../images/pm_projection_pu_res.jpg" alt="Plan Tree" width="50%"/>
+
+##### Push Down
+During the push-down phase, columns that appear only above the `Projection` node — referred to as `newcomers` — cannot pass through it directly. Removing `newcomers` from the set causes information loss. For example, if we have an equivalent set `{#2, #5}`, where `#5` is newcomer, erasing `#5` from the set causes the loss of information `#2 = #5`. Thus, `newcomers` must be and can always be rewritten as expressions composed of columns that are known to the nodes below, namely `survivors + victims`. 
+
+We go through equalSets and check each set, if it contains `newcomers`, we must generate predicates before removing these columns. For instance,
+<img src="../images/pm_projection_pd.jpg" alt="Plan Tree" width="70%"/>
+
+`#6` is a newcomers, from its definition we know `#6 = #3 + #5`. We generate the following expression:
+> #4 = #3 + #5
+
+Pseudo code of the algorithm:
+
+```c++
+// convert equalSets into a list of predicates
+for set in equalSets:
+    if set.size == 1:
+        continue
+    if set does not contain newcomers:
+        continue
+    survivors, newcomers = set.split()
+    new_predicates = expressions[]
+    if survivors.size == 0:
+        // all elements are new comers
+        // generate and add predicates:
+        new_predicates add "newcomers[0] = newcomers[1]"
+        new_predicates add "newcomers[1] = newcomers[2]"
+        new_predicates add "newcomers[2] = newcomers[3]"
+        ...
+        new_predicates add "newcomers[n-2] = newcomers[n-1]"
+    else:
+        // at least one element is a survivor
+        pivot = survivors[0]
+        // generate and add predicates:
+        new_predicates add "pivot = newcomers[0]"
+        new_predicates add "pivot = newcomers[1]"
+        new_predicates add "pivot = newcomers[2]"
+        ...
+        new_predicates add "pivot = newcomers[n-1]"
+    // convert all new comers into expressions
+    for pred in new_predicates:
+        substitute newcomers[i] into expresssions[i]
+
+```
+
+The generated predicates goes to `conditions` in the summary.
+
+In a similar way, we check all predicates in `conditions` and replace `newcomers` with their corresponding expressions. We can change the first predicate of `conditions`, that is, `#2 - #6 = 23`, into `#2 - (#3 + #5) = 23`.
+
+After we finishing processing `equalSet` and `conditions`, we need to merge the summary with the one stored in buffer, if exists, to build the final summary sent to child.
+
+#### Limit
 
 
 
