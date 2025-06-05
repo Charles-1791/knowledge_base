@@ -294,6 +294,50 @@ In a similar way, we check all predicates in `conditions` and replace `newcomers
 After we finishing processing `equalSet` and `conditions`, we need to merge the summary with the one stored in buffer, if exists, to build the final summary sent to child.
 
 #### Limit
+##### Pull Up
+`Limit` keeps a certain number of rows without changing their values, so no further modification on summary is required. A natural practice is to directly return the child summary to father, but due to the reason to be discussed, we keep in buffer an extra copy of summary.
 
+<img src="../images/pm_limit_pu.jpg" alt="Plan Tree" width="50%"/>
 
+##### Push Down
+`Limit` is fascinating for its semipermeability - summaries from the child node can flow upward to its parent, but not the other way around. The reasoning is simple: predicates above a `Limit` are evaluated after the `Limit` has already restricted the number of rows. If we push such a predicate below the `Limit`, it might filter out rows prematurely, allowing different rows to reach the `Limit` — and that would change the query's result.
 
+Knowing that a summary should not fall through a `Limit`, a natural practice is to flatten the summary into predicates, which goes to to a newly generated `Selection` node hanging above the `Limit`, like what we do in `TableScan` chapter. After that, we use the summary stored in buffer for further push down. This approach works, but at the same time causes the 'redundant predicates' problem. Recall that in pull up phase, we returned the child's summary directly, call it `summary_up`, so now, the summary received from parent node, namely, `summary_down`, must have contained at least as much "information" as `summary_up`. 
+
+Taken the following image as an example:
+<img src="../images/pm_limit_pd.jpg" alt="Limit Push down" width="60%"/>
+
+From the `equalSet` in `summary_up`, we know that `#3 = #4` and `#5 = #6`. These two equations still hold in `summary_down`. Checking the `conditions`, we see that `#1 - #2 = 10` appears in both `summary_up` and `summary_down`. Condition `#3 > 15` in `summary_up` changes into `#2 > 15` in `summary_down`, which is its equivalent form since we have `#2 = #3`. In fact, the judge of equivalent for predicates is a tricky point we shall cover later on.
+
+**equalSet Processing**
+
+Comparing `equalSets` from `summary_down` and `summary_up`, we found a new equation - `#2 = #3`. This piece of information must have come from a node above, and it should not pass through `Limit`. Notably, new predicates(equations over columns) can "glue" several sets together, forming a larger one. What we need to do is to "tear" it apart into their original forms. But can we always achieve this?
+
+The answer is yes. The rationale behind is simple: except for `Projection`, an equivalent set in `summary_up` is always fully contained in some equivalent set of `summary_down` because there's no operation to "unequal" them.
+
+Partitioning a set losses information - when we rip off `#2` from `{#2, #3, #4}`, the equation `#2 = #3` is lost. Thus, we need to stored it a `Selection` node. In conclusion, our algorithm of tearing a single set is:
+
+> For each set, split it into`n` smaller subsets based on summary_up. equalSets. Pick one column from each subsets(a nice practice is to choose those with indexes) and generate `n-1` equations. 
+> Assume the following columns are chosen from subsets:
+
+> #1, #2, #3, #4, ..., #n.
+
+> We generate:
+
+> #1 = #2, #2 = #3, #3 = #4, ..., #n-1 = #n
+
+The process is similar to tearing a pizza into several pieces, leaving cheese strands connecting every two pieces. The generated predicates are just like these strands, gluing together 'shards' of an equivalent set.
+
+**conditions processing**
+A predicate pd1 is considered redundant when there exists a predicate pd2 in `summary_up` such that pd1 is equivalent to pd2. Nevertheless, evaluating equivalency must consult a `equalSets`, since we have two: one in `summary_up` and one in `summary_down`, which one to use? 
+
+The answer is the second one. Revisit the example:
+
+<img src="../images/pm_limit_pd.jpg" alt="Limit Push down" width="60%"/>
+
+We have the predicate `#3 > 15` in `summary_up`, which means that any tuple reaching the `Selection` node above the Limit has already satisfied this condition. Recall that this `Selection` collects all predicates that could not be pushed down. To pass through it, a tuple must also satisfy the condition `#2 = #3`, which is one of the predicates inside the node. By combining `#3 > 15` and `#2 = #3`, we can infer that `#2 > 15` must also hold. Therefore, adding `#2 > 15` explicitly is unnecessary.
+
+After push down, the plan tree looks like:
+<img src="../images/pm_limit_pd_after.jpg" alt="Limit Push down" width="60%"/>
+
+#### Aggregation
