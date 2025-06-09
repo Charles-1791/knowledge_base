@@ -384,4 +384,20 @@ func main() {
 }
 ```
 
+### Costs of Using an Interface
+An interface in golang is two-word long, which is 16 bytes on a 64-bit machine. The first word stores a pointer to an internal structure containing the concrete type information and a method table. And the second pointer points to the address of the concrete instance.
 
+A method table in Go is similar to a virtual table (vtable) in C++ — it acts as a jump table that stores function pointers for each method declared in the interface. As a result, calling a method on an interface incurs more overhead than calling a concrete method directly. It involves dereferencing the interface's first word to access the `itab`, then using a fixed offset to fetch the appropriate function pointer from the method table, and finally performing an indirect call with the data pointer as the receiver.
+
+```golang
+interface {
+    itab *itab     // pointer to interface-table
+    data *T        // pointer to concrete value
+}
+```
+
+
+## Switch Clause
+In golang, a switch clause is like a multiple if-elseif-else: all the cases are evaluated in order, whereas in c++, where the switch key must be an integer or enum, compiler may build jump table or a binary search tree to achieve faster matching.
+
+The evaluate-cases-in-order feature demands extra attention to a type switch, where the key is an interface. 
