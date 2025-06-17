@@ -1,17 +1,16 @@
 # Golang Notes
 
 ## compilation
-- "go run xxx.go" compiles a single input and execute it
+- "go run xxx.go" compiles and execute a single go file(with `main()` function).
 
-- "go build xxx.go" creates an executable binary
+- "go build xxx.go" creates an executable binary in the current directory but not executes it
 
-- func init() {} is a special function automatically called when the program are executed. It can not be called in the code.
+- The function `init()` is a special initialization function in Go. It is automatically invoked by the runtime before the `main()` function runs, and you cannot call `init()` explicitly in your code.
 
 ## syntax
-- a++ is a statement, not a expression, so b = a++ is invalid
+- a++ is a statement, not a expression. statement like `b = a++` is invalid.
 
 ## Golang type categories
-
 ### basic types
 - int, int8, int16, int32, int64
 - uint, uint8, uint16, uint32, uint64
@@ -37,16 +36,15 @@ consider them as pointers
 - interface
 
 ## string, []byte and []rune
+- `strings` are immutable. To modify a character within a `string`, you need to convert the `string` into a `[]rune`, make the modification, and then convert it back to a `string`.
 
-String is immutable. To change a character, we need to convert string into []rune on which we apply the modification and then convert it back.
+- Go strings follow the `UTF-8` standard, characters (`runes`) may be composed of multiple bytes. Therefore, the correct way to iterate over characters in a string is to convert it to a []rune and iterate over the runes.
 
-Obeying the UTF-8 standard, a string may contain characters made up of multiple bytes, so the right approach to iterate the string is to convert it into []rune first, and go through it.
+- Alternatively, a for loop over a string like `for _, r := range str` iterates rune by rune, not byte by byte, decoding `UTF-8` correctly.
 
-a for-loop iterates a string rune by rune rather than byte by byte.
+- Converting a string into a []rune allocates new memory. Since rune is fixed-lengthed, the size of the converted []rune is at least as large as the original string's byte length
 
-Converting a string into a []rune allocates new memory. Since rune is fixed-lengthed, the size of the converted []rune is always no less than that of string.
-
-unsafe.Sizeof(x) can get the size of a variable, but if x is string, it returns its head size, that is 16 on a 64-bit system, we can consider a string in golang having the following structure:
+unsafe.Sizeof(x) returns a string's head size, which is 16 on a 64-bit system. Internally, a string in golang having the following structure:
 ```golang
 type string struct {
     Data *byte  // pointer to the actual UTF-8 bytes
@@ -56,9 +54,8 @@ type string struct {
 
 Converting a string to []byte also necessitates memory allocation, and so does the reverse.
 
-## array and slice
-
-### slice
+## Array and Slice
+### Slice
 - unsafe.Sizeof() returns a slice's head size, which is 24 on a 64-bit system. We may consider a slice like this:
 ```golang
 type slice struct {
@@ -72,8 +69,11 @@ type slice struct {
 - cap(slc) and return the capacity of the slice
 
 #### Memory Concern
+Using the subscript operator `X[i:j]` to create a sub-slice `Y` from a slice `X` does not allocate new memory. Instead, `Y` shares the same underlying array as `X`.
 
-- Using a subscript operator, that is X[i:j], to generate a sub-slice Y from some slice X actually allocates no memory. Mutation to Y would affect X unless Y points to a new piece of chunk, which happens when appending a new element after the capacity is exhausted. 
+This means that mutating elements of `Y` will also affect `X`, since they both refer to the same data.
+
+However, if you append to `Y` and the capacity of `Y` is exceeded, a new array is allocated and the existing elements are copied over. From that point on, `Y` refers to a different array, and further mutations no longer affect `X`.
 
 ```golang
 	X := []int{0,1,2,3,4,5,6,7,8}
@@ -98,7 +98,7 @@ type slice struct {
 	// output: Y = [300 400 500 600 700 800 900]
 ```
 
-- A slice allocates new memory when an element is appended beyond its current capacity. If the capacity is less than 1024, it typically grows by a factor of 2; for larger slices, the growth factor is around 1.5. However, according to my experiment, it is not the case.
+A slice allocates new memory when an element is appended beyond its current capacity. If the capacity is less than 1024, it typically grows by a factor of 2; for larger slices, the growth factor is around 1.5. However, according to my experiment, it is not the case.
 
 ```golang
 var test []int
@@ -157,7 +157,7 @@ size = 843777, capacity = 1055744, ratio is 1.251
 size = 1055745, capacity = 1319936, ratio is 1.250
 ```
 
-In C++, vector grows by 2x larger on my computer(x86, MacOS).
+In comparison, the `vector` in C++ grows by 2x larger on my PC (x64, MacOS).
 
 ### array
 - We can use T[...]{} to initialize an array, the size of which is deduced from the number of elements in curly brace.
@@ -166,60 +166,31 @@ In C++, vector grows by 2x larger on my computer(x86, MacOS).
 
 - We can use == to compare two arrays but not slices
 
-- When an array is used as a function input parameter, the function **deep copy** the original array. So mutation happened on the copied array doesn't go to the original input. Use *[]T to avoid copy.
+- When an array is used as a function input parameter, the function **deep copy** the original array. So mutation to a copied array doesn't affect the original one. Use *[length]T instead if you intend to change the elements or avoid copy.
 
 ## Map
-- unlike in c++, we cannot take the address of a value inside a map because the map may rehash and invalidate the original pointer. This feature is really similar to the unordered_map in c++, which invalidate all previously returned iterators upon rehashing.
+Unlike in c++, we cannot take the address of a value inside a map because the map may rehash and invalidate the original pointer. This feature resembles the behavior of `unordered_map::iterator` in c++, which invalidate all previously returned iterators upon rehashing.
 
 ## Struct
-- the following kind of initialization required every field to be offered a value. In other words, if some member is not exported, the following strategy cannot work.
+The following form of struct initialization requires all fields to be provided in order:
 ```golang
 type Point struct{ X, Y int }
 p := Point{1, 2}
 ```
+This approach cannot be used if any field is unexported (i.e., starts with a lowercase letter), because unexported fields cannot be accessed outside the defining package.
 
-### Anonymous Fields
-```golang
-type Point struct {
-    X, Y int
-}
+### Marshal
+json.Marshal() can convert a struct into a []byte, typically containing a JSON representation. However, a struct field must meet all of the following conditions to be marshaled:
 
-type Circle struct {
-    Point
-    Radius int
-}
+- It must be exported, that is, begin with an uppercase letter.
+- It does not have a json tag `json:"-"`.
+- Its type must be supported — basic types like string, int, bool, as well as slices, maps, structs, and pointers to those types.
 
-type Wheel struct {
-    Circle
-    Spokes int
-}
-```
-We say that a Point is embedded within Circle, and a Circle is embedded within Wheel.
+Additionally:
+- Exported anonymous embedded structs are marshaled, but only their exported fields are included.
+- If an embedded struct is unexported, it is ignored.
 
-Anonymous fields can be used to expose functions. For instance, if we define the following two struct in package *tools*, 
-```golang
-type secret struct {
-	Sec int
-}
-
-func (s secret) Say() {
-	fmt.Printf("secret reveals itself\n")
-}
-
-type Public struct {
-	secret
-}
-```
-then we cannot create an instance in package *main*. However, we can create an instance of Public, through which the member variable Sec and function Say() are available for use.
-
-### Marshal and Unmarshal
-json.Marsh() can convert a struct into a []byte. But a member must meet all of the following requirements to be marshalled:
-
-- it is exported, that is, begin with an upper-cased alphabet
-- it does not have a json tag `json:"-"`
-- it belongs to: basic types such as string, int, bool, or slices, maps, structs, pointers
-
-Exported anonymous embedded structs are not marshaled.
+An unexported struct type in Go can be marshaled by json.Marshal only if the call occurs within the same package where the type is defined. In that case, reflection can access the exported fields and include them in the output. However, if the type is unexported and used from another package, its structure is hidden to reflection, and marshaling it will result in an empty JSON object ({}).
 
 ## Closure pitfall's c++ counterpart
 Inside a for loop, using the iteration variable in a go routine or a callback function is a well-known pitfall. I happened to create a counterpart in c++ to help understand such phenomenon:

@@ -53,10 +53,10 @@ int operator()(int a, int b) const {
 ## About Class/Struct
 ### Memory Layout
 #### Member functions
-All member functions are compiled into machine instructions and stored at fixed addresses, specifically a read-only area called `.text`. The rationale is simple, enable sharing among instances of the same class.
+All member functions are compiled into machine instructions and stored at fixed addresses, typically in a read-only section called `.text`. This design allows instances of the same class to share the same function code, avoiding duplication and improving memory efficiency.
 
 #### Member variable
-A non-static member variable is stored in the instance itself, so it can be on stack or heap.
+Since a non-static member variable is stored in the instance itself, it can be on stack or heap.
 
 #### Non-Const Static Member 
 If initialized, it is stored in the `.data` segment, otherwise, it is initialized in `.bss` segment.
@@ -69,9 +69,9 @@ If a class has at least one virtual function, then the compiler generates a hidd
 
 ### Function Call
 #### Non-Virtual Function Call
-The compiler translates these calls into calls to a fixed address because the function’s address is known at compile time.
+The compiler translates member function calls into calls to fixed addresses, as the function's location is known at compile time.
 
-As mentioned earlier, the machine instructions for member functions are shared among all instances. Therefore, the call implicitly passes the this pointer as a hidden argument to operate on the specific instance.
+As mentioned earlier, the machine instructions for member functions are shared across all instances of a class. To allow these shared functions to operate on specific instances, the compiler implicitly passes the `this` pointer as a hidden argument with each call.
 
 #### Virtual Function Call
 A virtual function call must be triggered through a reference or pointer. It resembles calling a method on an interface in Go.
@@ -120,9 +120,9 @@ int main() {
     return 0;
 }
 ```
-The process involves three copy control function calls - in `getFoo`, when `f` is created, the `default constructor` is called; when `getFoo` returns `f`, which is going to be popped out of stack `f`, the `move constructor` is called; eventually, at the time the return value is used to initialize `tmp`, another `move constructor` is called. (If Foo has no move constructor, the copy constructor would be called twice).
+The process involves three copy-control function calls. In `getFoo`, when `f` is created, the `default constructor` is invoked. When `getFoo` returns `f`, which is going to be popped out of stack, the `move constructor` is called. Eventually, when the return value is used to initialize `tmp`, another `move constructor` is called. (If Foo has no move constructor, the copy constructor would be called twice instead).
 
-However, if you try to compile the cpp file and execute it, you would find that only the `default constructor` is called. That's because the compiler did a `RVO (Return Value Optimization)`RVO (Return Value Optimization), which lets the compiler construct the return value directly in the memory location of the caller, skipping the need for a copy or move.
+However, if you compile and run the code above, you would observe that only the `default constructor` is called. That's because the compiler did a `RVO (Return Value Optimization)`, which lets the compiler construct the return value directly in the memory location of the caller, skipping the need for a copy or move.
 
 To disable RVO and observe the exact copy control calls, do this:
 
@@ -185,6 +185,11 @@ inline void foo_func(int input) {
     ...
 }
 ```
+
+### Const Global Variables
+A const global variable defined in a header file does not trigger a multiple definition error, even when not marked extern, because in C++, const variables have internal linkage by default. This behavior is similar to a static global variable in a header: each translation unit (i.e., each .cpp file that includes the header) gets its own separate copy of the variable.
+
+In other words, the variable is not shared across files, but rather duplicated into each compilation unit. This is why defining a const in a header is safe, as long as you don't rely on a single, shared instance.
 
 ### Implicit Inline Marks
 You may wonder: since definition should not appear in a head file unless marked `inline`, why can we define some member functions inside a class definition, which usually resides in a head file. 
