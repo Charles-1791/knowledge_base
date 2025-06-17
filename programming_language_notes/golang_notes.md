@@ -157,7 +157,7 @@ size = 843777, capacity = 1055744, ratio is 1.251
 size = 1055745, capacity = 1319936, ratio is 1.250
 ```
 
-In C++, vector grows by 2x larger on my computer.
+In C++, vector grows by 2x larger on my computer(x86, MacOS).
 
 ### array
 - We can use T[...]{} to initialize an array, the size of which is deduced from the number of elements in curly brace.
@@ -401,3 +401,170 @@ interface {
 In golang, a switch clause is like a multiple if-elseif-else: all the cases are evaluated in order, whereas in c++, where the switch key must be an integer or enum, compiler may build jump table or a binary search tree to achieve faster matching.
 
 The evaluate-cases-in-order feature demands extra attention to a type switch, where the key is an interface. 
+
+## A Trick -- "Retract" What You Printed in A Bash
+- Check how many characters have been output, say N. 
+- Generate a string containing N blank spaces with `strings.Repeat(" ", N)`
+- Return the cursor to the start of the current line, print the blank spaces, like `fmt.Printf("/r%s", blankspaces)`
+
+We can use this trick to print "LOADING...":
+
+```golang
+func printWaiting(stopChan <-chan struct{}) {
+	strs := "LOADING..."
+	padding := strings.Repeat(" ", len(strs))
+outer: for {
+		select {
+		case <- stopChan:
+			break outer
+		default:
+			fmt.Print("\r")
+			for i:=0; i<len(strs); i++{
+				fmt.Printf("%c",strs[i])
+				time.Sleep(time.Millisecond * 200)
+			}
+			fmt.Print("\r" + padding)
+		}
+	}
+}
+```
+
+## Blank Import
+Sometimes we see imports like this:
+```golang
+_ "github.com/go-sql-driver/mysql"
+```
+The purpose is to trigger an init() function defined inside that package, which usually initializes some variables or setup certain entries. For instance, in the `driver.go` of the `mysql` package, an entry is inserted into a global variable in `sql` package:
+```golang
+func init() {
+	if driverName != "" {
+		sql.Register(driverName, &MySQLDriver{})
+	}
+}
+```
+When you call sql.Open to create a connection to MySQL, the stored driver is retrieved to do the real job.
+```golang
+func Open(driverName, dataSourceName string) (*DB, error) {
+	driversMu.RLock()
+	driveri, ok := drivers[driverName]
+	driversMu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("sql: unknown driver %q (forgotten import?)", driverName)
+	}
+
+	if driverCtx, ok := driveri.(driver.DriverContext); ok {
+		connector, err := driverCtx.OpenConnector(dataSourceName)
+		if err != nil {
+			return nil, err
+		}
+		return OpenDB(connector), nil
+	}
+
+	return OpenDB(dsnConnector{dsn: dataSourceName, driver: driveri}), nil
+}
+
+```
+
+## GO.MOD & GOCACHE & GOMODCACHE
+After golang 1.11, a project does not need to locate inside `$GOPATH`. By running `go mod init your_module_name`, a `go.mod` and a `go.sum` file are generated.
+
+When you build your module, before linking happens, each packages was compiled into a `.a` file, which is stored in `GOCACHE`. You can check your path with:
+```bash
+go env GOCACHE
+```
+
+`GOMODCACHE` is the path where dependency source codes are downloaded when `go get`(or `go build`, which triggers `go get`) is called.
+
+```bash
+go env GOMODCACHE
+```
+
+Both GOCACHE and GOMODCACHE can be modified like this:
+in ~/.bashrc
+```bash
+export GOMODCACHE=your_path
+export GOCACHE=your_path
+```
+
+## Go External Test
+Suppose package `B` imports package `A`, and we want to add some `_test.go` files to package `A`. However, these tests need to use variables or functions defined in `B`. To avoid cyclic imports, we place the tests in an external test package named `A_test`. This external test package is not located in a separate directory; instead, all `_test.go` files reside alongside the production code files within package `A`’s directory.
+
+Since `A_test` is a separate package, its test files cannot access unexported members of package `A` directly. To work around this, we create a special Go file inside package `A` (usually named `export_test.go`) that selectively exposes internals only for the tests. 
+
+A real `export_test.go` looks like:
+
+```golang
+package fmt
+
+var IsSpace = isSpace
+var Parsenum = parsenum
+```
+
+## Reflect
+### Value.Elem() VS Type.Elem()
+Both `reflect.Value` and `reflect.Type` have a member function `Elem()`, but they have distinct meanings.
+| caller | return value | meaning| valid caller type |
+|-|-|-|-|
+|reflect.Value|reflect.Value|"dereferencing" the address where pointer or interface points to| Interface, Pointer|
+| reflect.Type|reflect.Type| what is the type of the elements inside the container | Map, Slice, Array, Chan |
+
+Interestingly, for a reflect.Value `x` of kind `Pointer`, for instance, `x := reflect.ValueOf(&y)`:
+- `x.Elem()` returns the "reference" or "left-value"(c++) of variable y, and it is `Addressable`. It is also settable, that is,`CanSet() == true`, if it points to an exported member.
+- `x.Type().Elem()` returns the type which x points to, namely, `y`. 
+
+### reflect.Value.Method(i) VS reflect.Type.Method(i)
+Both `reflect.Value` and `reflect.Type` have a method called `Method(i)`, and they have certain disparities.
+
+Say that we have `x := reflect.Value(&Foo{})`
+
+#### reflect.Value.Method(i)
+`x.Method(i)` returns a `method value`, namely, an `address` or a `function pointer`. It stores no information about the method name. So there is not `Name` member of `Method(i).Type()`. Recall that [method value](#method-value-vs-method-expression) stores the address of the instance into it, therefore, the first input variable is not a pointer to the caller instance. In addition, since `x.Method(i)` returns an `address`, it is callable.
+
+#### Reflect.Type.Method(i)
+x.Type() returns the metadata of a value, which carries no information about the `callable address`, as a result, `Type().Method(i)` is not callable. However, in the metadata store the method names, as well as their input parameters and return values. In contrast, `Type().Method().In(0)` is always the receiver itself.
+
+```golang
+type Phone struct {
+	Owner string
+}
+
+func (ph *Phone) Call(callAt time.Duration) {
+	fmt.Printf("%s made at phone call at %v", ph.Owner, callAt)
+}
+
+func TestMethodType(t *testing.T) {
+	ph := &Phone{
+		Owner: "Charles",
+	}
+	rval := reflect.ValueOf(ph)
+	// Output: rval.Method(0).Type() = func(time.Duration)
+	fmt.Printf("rval.Method(0).Type() = %s\n", rval.Method(0).Type().String())
+	tval := reflect.TypeOf(ph) 
+	// Output: tval.Method(0).Type = func(*myformatter.Phone, time.Duration)
+	fmt.Printf("tval.Method(0).Type = %s\n", tval.Method(0).Type.String()) 
+}
+
+```
+
+#### Summary
+|  | Return Type | Callable? | Method name obtainable? | First parameter |
+|-|-|-|-| -|
+| reflect.Value.Method(i) | reflect.Value | YES | NO | First Parameter in Signature |
+| reflect.Type.Method(i) | reflect.Method | NO | YES | Method Receiver |
+
+## Unsafe
+### Converting unsafe.Pointer to uintptr is hazardous
+#### GC may move stack allocated object
+
+Go uses a `non-moving` garbage collector for heap-allocated objects, which guarantees that heap pointers remain stable during GC. However, this guarantee does not apply to stack-allocated variables.
+
+Go's stacks are small at first (typically 2 KB) and can grow. When this happens, variables on the stack may be moved to a new memory region. Normally, Go tracks and adjusts all legitimate pointers — including unsafe.Pointer — so they remain valid after a stack move.
+
+But once a uintptr is used to store an address (converted from unsafe.Pointer), the GC no longer tracks it as a pointer. From the GC’s perspective, it's just a number. If the original object is moved (e.g., due to stack growth), the value stored in uintptr becomes stale and invalid, potentially leading to undefined behavior.
+
+#### GC may recycle the heap or stack allocated object
+
+Another risk arises when you convert an unsafe.Pointer to a uintptr and the original pointer is no longer referenced. Because uintptr is not considered a pointer, the garbage collector may reclaim the memory that the original pointer referred to — even though you still have the address stored in uintptr.
+
+As a result, dereferencing that address can lead to accessing freed or repurposed memory — a classic use-after-free scenario.
+

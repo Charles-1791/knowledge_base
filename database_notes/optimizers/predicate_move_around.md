@@ -341,3 +341,25 @@ After push down, the plan tree looks like:
 <img src="../images/pm_limit_pd_after.jpg" alt="Limit Push down" width="60%"/>
 
 #### Aggregation
+An `Aggregation` selects specific columns, groups tuples based on them, and combines rows within each group into a single output row using aggregate functions. Similar to `Projection`, `Aggregation` retains certain columns — those specified in the `GROUP BY` clause — produces new columns using aggregate functions like `SUM(), AVG(), or MIN()`, and discards columns that are consumed by these functions. In other words, it also has `survivors`, `victims` and `newcomers`:
+
+| column types | description |
+|------------|-|
+| survivors | simple columns in group by clause|
+| newcomers | aggregation functions |
+| victims | columns not in group by clause|
+
+During pull up phase, the arithmetic relations among survivors are retained since no changes are applied to them, whereas predicates or equal set containing victims need to be converted or stored into buffer for future use, just as we do in `Projection`.
+
+When we do push down, any conditions involving `newcomers` — i.e., expressions not present in the GROUP BY — must remain above the `Aggregation`. This differs from `Projection`, where `newcomers` can always be substitute by expressions containing only `survivors`, enabling further push down. In contrast, `newcomers` in `Aggregation` involve aggregate functions, which cannot be pushed below the aggregation node.
+
+#### 
+
+
+
+
+
+
+
+
+
