@@ -1,4 +1,4 @@
-# C++ Notes
+# C++ Primer Read Notes
 ## When a function returns a function pointer ...
 ### Variables captured by reference
 We have the following scenario:
@@ -189,7 +189,8 @@ inline void foo_func(int input) {
 ### Const Global Variables
 A const global variable defined in a header file does not trigger a multiple definition error, even when not marked extern, because in C++, const variables have internal linkage by default. This behavior is similar to a static global variable in a header: each translation unit (i.e., each .cpp file that includes the header) gets its own separate copy of the variable.
 
-In other words, the variable is not shared across files, but rather duplicated into each compilation unit. This is why defining a const in a header is safe, as long as you don't rely on a single, shared instance.
+In other words, the variable is not shared across files, but rather duplicated into each compilation unit. If you need a shard const global variable, you need to separate its declaration and definition, as we do to normal global variable.
+
 
 ### Implicit Inline Marks
 You may wonder: since definition should not appear in a head file unless marked `inline`, why can we define some member functions inside a class definition, which usually resides in a head file. 

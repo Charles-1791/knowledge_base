@@ -1,4 +1,4 @@
-# Golang Notes
+# Go Programming Language Read Notes
 
 ## compilation
 - "go run xxx.go" compiles and execute a single go file(with `main()` function).
