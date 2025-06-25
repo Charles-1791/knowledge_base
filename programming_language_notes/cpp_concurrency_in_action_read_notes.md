@@ -200,13 +200,120 @@ The atomic flag indicates whether the function is finished(done). When call_once
 A digression: after C++, a local static variable's initialization is guaranteed to be thread safe by C++'s implementation.
 
 ## Future, Packaged_task and Promise
-### std::future
-#### std::async and std::future
-`std::async` takes in a launch policy, a function, and its arguments. It returns a `std::future`, through which we can retrieve the result — the return value of the input function — by calling `get()`.
+Since all these three classes employ the same method for synchronization, let's discuss it first.
+### _State_baseV2 - A Common Variable
+`std::future`, `std::packaged_task`, `std::promise` and `std::shared_future` all directly or indirectly contain a special member variable - a shared pointer of type `_State_base`, which is just a synonym of `_State_baseV2`.
+```c++
+using _State_base = _State_baseV2;
+```
+Such state is the core for synchronization - it determines the right action when `std::future::wait()` is called, it synchronizes between a `std::packaged_task` and a `std::future`, it is also the link between `std::promise` with `std::future`. 
 
-The launch policy can be either `std::launch::async` or `std::launch::deferred`. The former implies starting a new thread immediately for function execution, while the latter postpones the  execution of the function until `wait()` or `get()` is called. Moreover, `deferred` also means executing the given function in the caller's thread, just as you initialized a lambda and calls it later on. 
+`std::future` inherits the state from its parent class `__basic_future`,
+```c++
+/// Primary template for future.
+template<typename _Res>
+class future : public __basic_future<_Res> {/*...*/}
 
-When no policy is given, `std::launch::async` is used. 
+template<typename _Res>
+class __basic_future : public __future_base {
+protected:
+    typedef shared_ptr<_State_base>		__state_type;
+    typedef __future_base::_Result<_Res>&	__result_type;
+private:
+    __state_type 		_M_state;
+}
+```
+`std::packaged_task` holds a shard pointer to a derived class of `_State_base`:
+```c++
+/// packaged_task
+template<typename _Res, typename... _ArgTypes>
+class packaged_task<_Res(_ArgTypes...)>
+{
+    typedef __future_base::_Task_state_base<_Res(_ArgTypes...)> _State_type;
+    shared_ptr<_State_type>                   _M_state;
+    // ...
+}
+
+// Holds storage for a packaged_task's result.
+template<typename _Res, typename... _Args>
+struct __future_base::_Task_state_base<_Res(_Args...)>
+: __future_base::_State_base
+```
+and `std::promise` owns a shared pointer of such state.
+```c++
+/// Primary template for promise
+template<typename _Res>
+class promise
+{
+    typedef __future_base::_State_base 	_State;
+    //...
+    shared_ptr<_State> _M_future;
+}
+```
+### Synchronization Mechanism of _State_baseV2
+Take a look at the state's definition:
+```c++
+class _State_baseV2 {
+    typedef _Ptr<_Result_base> _Ptr_type;
+
+    enum _Status : unsigned {
+        __not_ready,
+        __ready
+    };
+
+    _Ptr_type			_M_result;
+    __atomic_futex_unsigned<>	_M_status;
+    atomic_flag         	_M_retrieved = ATOMIC_FLAG_INIT;
+    once_flag			_M_once;
+    
+    _Result_base& wait();
+
+    void _M_set_result(function<_Ptr_type()> __res, bool __ignore_failure = false);
+}
+```
+it contains an `__atomic_futex_unsigned`, a struct providing synchronized functionalities that are implemented by system calls(I will not dive deeper, sry). Two functions need our attention, `wait()` and `_M_set_result()`. The former waits for the `_M_status` to be ready and the latter sets it up.
+
+`wait()` is invoked whenever a `future::wait()` or `future::get()` is called. Here is the implementation of `wait()`
+```c++
+ wait() {
+    // Run any deferred function or join any asynchronous thread:
+    _M_complete_async();
+    // Acquire MO makes sure this synchronizes with the thread that made
+    // the future ready.
+    _M_status._M_load_when_equal(_Status::__ready, memory_order_acquire);
+    return *_M_result;
+}
+
+// Wait for completion of async function.
+virtual void _M_complete_async() { }
+```
+Noticed that `_M_complete_async()` is a virtual function, indicating that subclasses of `_State_baseV2` may have their own implementations, as you shall see when we talk about std::async(). The default implementation is empty, doing nothing.
+
+In next line, function waits until the `_M_status` is ready.
+
+`_M_set_result()` is called when `std::promise::set_value()` is called. It sets the state to be ready by calling `_M_status._M_store_notify_all`, a thread safe function.
+```c++
+// Provide a result to the shared state and make it ready.
+// Calls at most once: _M_result = __res();
+void _M_set_result(function<_Ptr_type()> __res, bool __ignore_failure = false) {
+    bool __did_set = false;
+    // all calls to this function are serialized,
+    // side-effects of invoking __res only happen once
+    call_once(_M_once, &_State_baseV2::_M_do_set, this,std::__addressof(__res), std::__addressof(__did_set));
+    if (__did_set)
+        // Use release MO to synchronize with observers of the ready state.
+        _M_status._M_store_notify_all(_Status::__ready,
+                    memory_order_release);
+    else if (!__ignore_failure)
+        __throw_future_error(int(future_errc::promise_already_satisfied));
+}
+```
+Eventually, by waiting for and setting a futex, thread synchronization is achieved.
+
+### std::async and std::future
+`std::async` takes in a launch policy, a function and its arguments, returns a `std::future`, through which we can retrieve the result — the return value of the input function — by calling `get()`.
+
+The launch policy can be either `std::launch::async` or `std::launch::deferred`. The former implies starting a new thread immediately for function execution, while the latter postpones the  execution of the function until `wait()` or `get()` is called. Moreover, `deferred` also means executing the given function in the caller's thread, just as you initialized a lambda and calls it later on. When no policy is given, `std::launch::async` is used(because in the source code, the bits representing `async` is checked before `deferred`). 
 
 ```c++
 // libstdc++ source code:
@@ -222,145 +329,72 @@ async(_Fn&& __fn, _Args&&... __args)
 
 /// async
 template<typename _Fn, typename... _Args>
-_GLIBCXX_NODISCARD future<__async_result_of<_Fn, _Args...>>
-async(launch __policy, _Fn&& __fn, _Args&&... __args)
+_GLIBCXX_NODISCARD future<__async_result_of<_Fn, _Args...>> async(launch __policy, _Fn&& __fn, _Args&&... __args)
 {
     std::shared_ptr<__future_base::_State_base> __state;
-    if ((__policy & launch::async) == launch::async)
-    {
-        __try
-        {
+    if ((__policy & launch::async) == launch::async) {
+        __try {
             __state = __future_base::_S_make_async_state(
-            std::thread::__make_invoker(std::forward<_Fn>(__fn),
-                            std::forward<_Args>(__args)...)
+                std::thread::__make_invoker(std::forward<_Fn>(__fn),
+                                std::forward<_Args>(__args)...)
             );
         }
-        // ...
+    #if __cpp_exceptions
+        catch(const system_error& __e) {
+            // ...
+        }
+    #endif
     }
-```
-This can also be verified by a simple experiment:
-```c++
-int main() {
-    std::future<void> ft = std::async( []() {
-        cout << "std::function thread id: " << std::this_thread::get_id() << endl; // Output: std::function thread id: 140204404901632
-    });
-    cout << "main thread's id: " <<  std::this_thread::get_id() << endl; // Output:: main thread's id: 140204405569344
-    ft.get();
-    return 0;
-}
-```
-
-For the returned `future` object, `get()` can only be called once, as it moves the internally stored value out. After `get()` is called, the future becomes invalid and cannot be used again.
-```c++
-// libstdc++ source code:
-
-/// Retrieving the value
-_Res get()
-{
-    typename _Base_type::_Reset __reset(*this);
-    return std::move(this->_M_get_result()._M_value());
-}
-```
-
-#### Diving Deeper Into std::future
-`std::future` inherits from `__basic_future`, whose constructors are all `protected`. 
-```c++
-// stdlibc++ source code
-template<typename _Res>
-class __basic_future : public __future_base
-{
-private:
-    __state_type 		_M_state;
-protected:
-    // ...
-    explicit
-    __basic_future(const __state_type& __state) : _M_state(__state)
-    {
-    _State_base::_S_check(_M_state);
-    _M_state->_M_set_retrieved_flag();
+    if (!__state) {
+        __state = __future_base::_S_make_deferred_state(
+            std::thread::__make_invoker(std::forward<_Fn>(__fn),
+                        std::forward<_Args>(__args)...));
     }
-
-    // Copy construction from a shared_future
-    explicit
-    __basic_future(const shared_future<_Res>&) noexcept;
-
-    // Move construction from a shared_future
-    explicit
-    __basic_future(shared_future<_Res>&&) noexcept;
-
-    // Move construction from a future
-    explicit
-    __basic_future(future<_Res>&&) noexcept;
-
-    constexpr __basic_future() noexcept : _M_state() { }
-
-    // ...
-};
-
-```
-Internally, a `__basic_future` maintains a state named `_M_state`, which determines the right action when `wait()` is called. Before returning the result, a state always call a function `_M_complete_async()`.
-```c++
-// stdlibc++ source code
-class _State_baseV2 {
-    // ...
-   _Result_base&
-    wait()
-    {
-        // Run any deferred function or join any asynchronous thread:
-        _M_complete_async();
-        // Acquire MO makes sure this synchronizes with the thread that made
-        // the future ready.
-        _M_status._M_load_when_equal(_Status::__ready, memory_order_acquire);
-        return *_M_result;
-    } 
-    // ...
-    // Wait for completion of async function.
-    virtual void _M_complete_async() { }
+    return future<__async_result_of<_Fn, _Args...>>(__state);
 }
-
 ```
-Noticed that `_M_complete_async()` is a virtual function, indicating that states inherits from `_State_baseV2` may have their own implementations. If a state fails to override this function, a `wait()` call would hang until the result is ready, exactly the case for the `future` returned by calling `get_future()` on `std::packaged_task`. 
+You may have noticed that __state is assigned differently, and this is exactly how the semantics of `async` and `deferred` is implemented. 
 
-In fact, this function is overridden by two derived class templates : `_Deferred_state` and `_Async_state_commonV2`, corresponding to `deferred` and `async`, the two policies for `std::future`.
+`_S_make_async_state` returns a subclass of `_State_baseV2`, and it overrides the `_M_complete_async()` virtual function - simply `join()` the thread created beforehand:
 ```c++
-// libstdc++ source code:
-using _State_base = _State_baseV2;
-// ...
-// Shared state created by std::async().
-// Holds a deferred function and storage for its result.
-template<typename _BoundFn, typename _Res>
-class __future_base::_Deferred_state final
-: public __future_base::_State_base {
-    // ...
-    virtual void _M_complete_async()
-    {
-        _M_set_result(_S_task_setter(_M_result, _M_fn), true);
-    }
-    // ...
-}
-
-// ...
-
-// Common functionality hoisted out of the _Async_state_impl template.
 class __future_base::_Async_state_commonV2
 : public __future_base::_State_base {
     // ...
     virtual void _M_complete_async() { _M_join(); }
+    void _M_join() { std::call_once(_M_once, &thread::join, &_M_thread); }
     // ...
 }
 ```
-Apparently, only when wait() is called does a `deferred` state executes the function. By comparison, `async` just `join()` the thread it created beforehand.
+Recall that `_M_complete_async()` is indirectly called when `future::get()` is invoked, therefore `future::get()` waits for the thread to finishes.
+
+By comparison, `_S_make_deferred_state` returns another subclass of `_State_baseV2`, which overriding `_M_complete_async()` into:
+```c++
+template<typename _BoundFn, typename _Res>
+class __future_base::_Deferred_state final : public __future_base::_State_base {
+    // Run the deferred function.
+    virtual void _M_complete_async() {
+        // Multiple threads can call a waiting function on the future and
+        // reach this point at the same time. The call_once in _M_set_result
+        // ensures only the first one run the deferred function, stores the
+        // result in _M_result, swaps that with the base _M_result and makes
+        // the state ready. Tell _M_set_result to ignore failure so all later
+        // calls do nothing.
+        _M_set_result(_S_task_setter(_M_result, _M_fn), true);
+    }
+}
+```
+It essentially runs the deferred function.
 
 ### std::packaged_task
 #### basic usage
-A `std::packaged_task` is a callable object that wraps any callable target (e.g., functions, lambdas, functors). Its template parameter is a function signature, such as `int(std::string)`, which specifies the return type and argument types.
+A `std::packaged_task` is a callable object that wraps any callable target (e.g., functions, lambdas, function object). Its template parameter is a function signature, such as `int(std::string)`, which specifies the return type and argument types.
 
 Because `std::packaged_task` is callable, it can be stored in a `std::function`. When you call its call operator (`operator()`), it executes the wrapped callable and sets the associated result in a `std::future`.
 
-Calling `get_future()` on a `std::packaged_task` returns a `std::future` that will hold the result of the task once it is executed. The future remains in a waiting state until the task is invoked and completes. Calling `wait()` or `get()` on the future will block until the task finishes execution.  
+Calling `get_future()` on a `std::packaged_task` returns a `std::future` that will hold the result of the task once it is executed. The future remains in a waiting state until the task is invoked and completes. Calling `wait()` or `get()` on the future will block until the task finishes execution. 
 
 #### Tie Between a Packed Task and its Future
-The fact that future can wait for task to be finished suggests some synchronization mechanism between them. It turns out to be a shared pointer of `_State_type`.
+The fact that `std::future` can wait for `std::packaged_task` to be finished suggests some synchronization mechanism between them. It turns out to be a shared pointer of `_State_type`.
 
 ```c++
 class packaged_task<_Res(_ArgTypes...)> {
@@ -373,36 +407,7 @@ class packaged_task<_Res(_ArgTypes...)> {
     }
 }
 ```
-The `future` returned by `get_future` takes a shared pointer of the internal state of the task. `wait()` waits for such state to be ready and the call operator of task sets certain bits in it once the given functions is finished. 
-
-Take a closer look at the state, it is of type `_Task_state_base`, which is a subclass of `_State_base`, aka `_State_baseV2`.
-```c++
-using _State_base = _State_baseV2;
-
-template<typename _Res, typename... _Args>
-struct __future_base::_Task_state_base<_Res(_Args...)>
-: __future_base::_State_base
-```
-In `_State_baseV2`, the member truly being watched and modified is `_M_status`, an `atomic futex`. Setting and waiting for such variable are done by atomic operations(syscalls), and are therefore guaranteed to be thread-safe. 
-```c++
-class _State_baseV2
-{
-    typedef _Ptr<_Result_base> _Ptr_type;
-    // ...
-    _Ptr_type			_M_result;
-    __atomic_futex_unsigned<>	_M_status;
-    // ...
-}
-```
-
-#### When the Call Operator is Never Invoked...
-When a future is out of scope, its destructor checks if the call operator has been called. If no, it stores a `broken_promise` exception into the internal state and immediately wakes up any thread waiting on the `future`:
-```c++
-~packaged_task() {
-    if (static_cast<bool>(_M_state) && !_M_state.unique())
-        _M_state->_M_break_promise(std::move(_M_state->_M_result));
-}
-```
+The `future` returned by `get_future` takes a shared pointer of the internal state of the task. As discussed above, `future::get()` waits for such state to be ready and the call operator of task sets the state once the given functions is finished. 
 
 ### std::promise
 std::promise and std::future usually appear in pairs, the former is a producer and the later is a consumer. Same to `future`, a the template argument of `promise` is the value it wishes to send to the `future`. A `promise` takes in no parameters and returns a `future` when `get_future()` is called. It has two fundamental member functions: `set_value()` and `set_exception()`. Only after either of the function is called then its corresponding `future`'s `get()` or `wait()` returns.
@@ -424,19 +429,90 @@ class promise
     //...
 }
 ```
-#### When Neither Value nor Exception is set
-Identical to packaged_task, its destructor sets a `broken_promise` exception when neither of set_value or set_exception is invoked.
+
+### Why is the Internal State a Shared Pointer 
+In the destructors of `std::promise` and `std::packaged_task`, you'll find logic like the following:
 ```c++
-~promise() {
-    if (static_cast<bool>(_M_future) && !_M_future.unique())
-        _M_future->_M_break_promise(std::move(_M_storage));
+if (static_cast<bool>(_M_state) && !_M_state.unique())
+        _M_state->_M_break_promise(std::move(_M_state->_M_result));
+```
+Basically, when a `task` or `promise` leaves its scope, the destructor checks whether its "job" is done — whether the task's call operator is called, or the `promise`'s `set_value` / `set_exception` is called. If not, it sets a `broken_promise` exception and wakes up any threads waiting on the future returned by it.
+
+However, what if no one is waiting? What if the task is created, but `get_future()` is never called? Then there's no need to set such an exception, since nobody cares.
+
+Here comes the clever design — using a shared pointer. Recall that when `get_future()` is called, a `std::future` is constructed, taking the internal state, which is a shared pointer. So the reference count (in the source code it's called `_M_refcount`) increments. Therefore, by checking whether it is the only holder of such a shared pointer, the destructor knows whether to set the exception — this explains the `_M_state.unique()` check in the code!
+
+### get_future() Can Only Be Called Once
+Both `std::promise` and `std::packaged_task` return a `std::future` when `get_future()` is invoked. But such invocation can only be down once. Calling it a second time throws a `future_already_retrieved` exception. The mechanism behind is simple - both class has the same `get_future()` implementation. 
+
+```c++
+shared_ptr<_State> _M_future;
+future<_Res> get_future()
+{ return future<_Res>(_M_future); }
+```
+The function returns a `future` constructed by a shared pointer of _State. The state is then used to construct the base class of `future`, namely, `__basic_future`.
+
+```c++
+// Construction of a future by promise::get_future()
+explicit
+__basic_future(const __state_type& __state) : _M_state(__state) {
+    _State_base::_S_check(_M_state);
+    _M_state->_M_set_retrieved_flag();
+}
+
+void _M_set_retrieved_flag() {
+    if (_M_retrieved.test_and_set())
+        __throw_future_error(int(future_errc::future_already_retrieved));
 }
 ```
+In its constructor, the state is tested and set(an atomic function).
+
+
+### std::shared_future
+Similar to `std::future`, a shared_future is also a subclass of `__basic_future`, but it's both copyable and moveable. A `std::shared_future` can be created by either giving an rvalue of `std::future` or calling `std::future::share()`.
+
+In addition, `get()` can be called multiple times on a certain `shared_future` in that it does not move the result out like `future` does.
+
+```c++
+// future:
+/// Retrieving the value
+_Res get() {
+    typename _Base_type::_Reset __reset(*this);
+    return std::move(this->_M_get_result()._M_value());
+}
+
+// shared_future:
+/// Retrieving the value
+const _Res& get() const { return this->_M_get_result()._M_value(); }
+```
+
+> _"Now, with std::shared_future, member functions on an individual object are still unsynchronized, so to avoid data races when accessing a single object from multiple threads, you must protect accesses with a lock. The preferred way to use it would be to pass a copy of the shared_future object to each thread, so each thread can access its own local shared_future object safely, as the internals are now correctly synchronized by the library. Accessing the shared asynchronous state from multiple threads is safe if each thread accesses that state through its own std::shared_future object."_
+
 
 ## Quick Reference Thread Related Templates
 | Objects | template type | template argument| Constructor takes in | Copyable ? | Moveable ? |
 |-|-|-|-|-|-|
 | std::future | class | type of return value | Usually Not Constructed Directly | NO | YES |
+| std::shared_future | class | type of return value | std::future&& | YES | YES |
 | std::async | function | function signature | callable and arguments | - | - | 
 | std::packaged_task | class | function signature | callable | NO | YES|
 | std::promise | class | type of return value | NA | NO | YES |
+
+## Atomic Variable
+### Compare Exchange Weak & Strong
+There are two member functions of `std::atomic<T>`, `compare_exchange_weak` and `compare_exchange_strong`. On a platform where compare and swap is an atomic instruction, such as x86, these two functions have exactly the same effect - check if the current atomic owns a certain value, if so, modify it into a different one; otherwise, store the current value into the reference. Nevertheless, on a platform such as arm64, where compare and swap is implemented in multiple instructions, `compare_exchange_weak` may fail even when expected value == the atomic. At such times, `compare_exchange_strong` retries the assignment continuously when there is a spurious failure. Conceptually, it acts as if:
+
+```c++
+template<typename T>
+bool compare_exchange_strong(std::atomic<T>& atomic_obj, T& expected, T desired) {
+    T original = expected;
+    while (!atomic_obj.compare_exchange_weak(expected, desired)) {
+        if (expected != original) {
+            // Real mismatch: atomic value changed by another thread
+            break;
+        }
+        // Spurious failure: retry
+    }
+    return expected == original;
+}
+```
