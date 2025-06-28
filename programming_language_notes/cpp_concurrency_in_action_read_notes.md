@@ -516,3 +516,129 @@ bool compare_exchange_strong(std::atomic<T>& atomic_obj, T& expected, T desired)
     return expected == original;
 }
 ```
+### User Defined Atomic Type
+#### Restrictions
+std::atomic<T> templates enables us to create atomic version of user defined types. However, such template imposes stringent requirements for the underlying struct/class - it must be trivially copyable.
+
+Trivially copyable, as its name suggests, means that a new object of that class can be created by copying the raw bytes of an existing one using only `memcpy`. It implies that for a class:
+
+1. All the copy/move control members, namely copy constructor, copy operator, move constructor, move operator, destructor, must be compiler synthesized, or marked "= default".
+2. Does not contain any self-defined or inherited `virtual` functions.
+3. Neither the type nor any of its base classes may use `virtual` inheritance.
+
+The rationale behind is simple: the template regards a user defined type as a piece of continuous memory(raw bytes).
+
+#### Lock Free Criteria
+Since compiler treats `T` in `atomic<T>` as a block of raw bytes, if `sizeof(T)` is larger than the word size, a mutex needs to be used. As seen above, compare and exchange is usually implemented by a single machine instruction which accepts at most word-sized memory. If sizeof(T) is larger than word size or misaligned across word boundaries, such instruction must be called multiple times. To protect the data from being modified by another thread in between these calls, a mutex will be needed, making `atomic<T>` NOT lock free.
+
+When a `atomic<T>` is not lock free, since we’re adding a mutex anyway, why not manage it ourselves and relax the trivially copyable requirements? Well, it is trade-off: use library provided atomic avoids incorrect memory order problem and the code is less error pruning, while manage mutex ourselves gives us the more freedom, perhaps finer granularity.
+
+### Memory Ordering
+It's really an intricate topic.
+
+`Memory order` is a tool designed to manage and coordinate:
+- Compiler-level reordering: The compiler optimizes by reordering instructions unless told not to.
+- CPU-level out-of-order execution: Modern CPUs execute instructions out-of-order to maximize throughput, so the hardware can reorder memory operations dynamically.
+- CPU cache coherence and memory visibility: Multiple cores with local caches need to keep data consistent and propagate updates in a way that respects synchronization.
+
+In reality, the surprising or “mysterious” behaviors you sometimes see in concurrent programs often results from the combination of these tree.
+
+#### memory_order::relaxed 
+This order applies no restriction on instructions ordering and CPU caching.
+
+Let's say we have an atomic variable named `x`, whose reference is shared among a few concurrent threads.
+
+`x.store(..., relaxed)` updates the corresponding cache entry in CPU it runs on, so that subsequent `x.store(..., load)` reads a version as new as this one. The store action also asks other CPUs to update their caches for `x`, but it happens at some unknown future time. As a result, a relaxed load on another thread running on a different core may possibly read a staled value in that only the CPU cache is consulted.
+
+For a single atomic variable, once a thread observes a particular version (value), it will only see that version or newer ones going forward — because the cache will only be updated with newer versions, never older ones. But for multiple atomic variables, each one’s updates propagate independently. So a thread may see different variables at different "versions," leading to inconsistent or unsynchronized observations across variables.
+
+#### memory_order::acquire and release
+These two usually appear in pairs, when a store is marked as `release`, when a load with `acquire` reads such stored value, it is guaranteed that any changes made before the store is visible to the load thread. 
+
+#### RMW Operation
+When a thread performs an `RMW` (Read Modify Write) such as fetch_sub and compare exchange, the CPU must gain exclusive ownership of the cache line that holds x.
+
+This involves:
+
+- Consulting other CPUs (via the cache coherence protocol, e.g., MESI or MOESI).
+- Asking them to invalidate or update their cached copies of that cache line.
+- Only after confirming it has the latest value (the most up-to-date version of x), can it safely read, modify, and write back the new value atomically.
+
+This arises a problem: if RMW always reads the newest version, calling it with `memory_order::acquire` seems meaningless. However, this understanding is incorrect, because the `memory_order::acquire` in an RMW is not for the RMW itself, but for what follows it:
+
+It doesn't affect the atomicity of the operation, which is always guaranteed, or how up-to-date the atomic variable's value is (that's guaranteed by cache coherence and the RMW mechanism). But it does influence the visibility of other memory written by another thread before a store(..., memory_order::release).
+
+```c++
+std::atomic<int> ready = 0;
+Data data;
+
+// Thread A
+data.fill();                                      // initialize shared data
+ready.store(1, std::memory_order_release);        // publish visibility
+
+// Thread B
+if (ready.fetch_sub(1, std::memory_order_acquire) > 0) {
+    use(data);                                    // safe: sees published writes
+}
+```
+In the example, thread B may not have been able to see the filled data had the `fetch_sub` takes in a memory_order_relaxed. BTW, the release-store and RMW forms a classic `release sequence`
+
+## Synchronized Data Structure
+### Defer Expensive Cleanup Outside Critical Sections
+Let’s say you need to change a pointer that’s protected by a mutex:
+```c++
+class Bar {
+    ~Bar() {
+        // some expensive operation
+    }
+};
+
+class Foo {
+    std::mutex mtx_;
+    Bar* ptr_;
+    void reset_ptr(Bar* new_addr) {
+        std::lock_guard<std::mutex> guard(mtx_);
+        delete ptr_;
+        ptr_ = new_addr;
+    }
+};
+```
+The code above works, but note that `delete ptr_` occurs while the mutex is locked. Since Bar's destructor may be expensive, it's good practice to perform such cleanup outside the critical section. A simple improvement would be:
+
+```c++
+void reset_ptr(Bar* new_addr) {
+    Bar* old_ptr;
+    {
+        std::lock_guard<std::mutex> guard(mtx_);
+        old_ptr = ptr_;
+        ptr_ = new_addr;
+    }
+    delete old_ptr;
+}
+```
+This is straightforward. But if Foo stores the pointer using a smart pointer like std::shared_ptr, the issue becomes subtler:
+```c++
+class Foo {
+    std::mutex mtx_;
+    std::shared_ptr<Bar> ptr_;
+    void reset_ptr(Bar* new_addr) {
+        std::lock_guard<std::mutex> guard(mtx_);
+        ptr_ = shared_ptr<Bar>(new_addr);
+    }
+};
+```
+Here, assigning a new `shared_ptr` to `ptr_` causes the old one’s reference count to decrement. If `ptr_` was the last reference, this reassignment destroys the `Bar` object inside the critical section — which again is not ideal for high-concurrency scenarios.
+
+A better approach is to defer the destruction:
+```c++
+void reset_ptr(Bar* new_addr) {
+    std::shared_ptr<Bar> defer;
+    {
+        std::lock_guard<std::mutex> guard(mtx_);
+        defer = std::move(ptr_);
+        ptr_ = shared_ptr<Bar>(new_addr);  
+    }
+    // `defer` goes out of scope here, after the lock is released
+}
+```
+By moving the old `shared_ptr` to a local variable, we delay its destruction until after the mutex is released. If this was the last reference, the actual destructor of Bar runs after the critical section.
