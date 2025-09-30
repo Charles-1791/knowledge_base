@@ -31,11 +31,11 @@ We could consider a lambda like a callable object like this:
 ```c++
 class Lambda {
 private:
-    int extra;
+    int extra_;
 public:
-    Lambda(int extra): extra(extra){} // a bad practice, only for illustration
+    Lambda(int extra): extra_(extra){}
     int operator()(int a, int b) {
-        ++extra;
+        ++extra_;
         return a + extra + b;
     }
 };
@@ -136,6 +136,35 @@ default ctor
 move ctor
 move ctor
 ```
+
+## Secrets Behind delete[]
+When we dynamically allocate an array with `T* arr = new T[sz]`, we need to recycle it after use by calling `delete []arr`. Since the arr only carries the starting address of the first element, the sz is not recorded, then how can the runtime know how much space to reclaim? 
+
+Before we offer the explanation, a notion needs to be clarified - `trivially destructible`. Similar to `trivially copyable`, a `trivially destructible` type indicates there is no customized destructor defined for this type. In other words, there is no extra work to be done when the variable of this type is out of scope like free memory on heap or close internet connection. For instance, `int`, `double`, `void*` has no destructor, so they are `trivially destructible`. 
+
+Now let's solve the puzzle. When `new` is called, the heap allocator always its own hidden bookkeeping metadata, which contains the allocated memory size. 
+
+- If the array elements are trivially destructible, then there is no need to know the exactly number of elements inside the array and the cleanup job is just a simple `free(mem_size)`.
+- If elements are not trivially destructible, destructors must be called for each element, necessitating the knowledge of element count. stdlibc++ achieves so by secretly storing a `size_t` before the first element. The following experiment unravels its existence.
+
+```c++
+struct Foo {
+    int* internal_ptr;
+    Foo(): internal_ptr(new int(0)) {}
+    ~Foo() {
+        delete internal_ptr;
+    }
+};
+
+int main() {
+    Foo* arr = new Foo[260];
+    size_t sz = *(reinterpret_cast<size_t*>(arr) - 1);
+    cout << sz << endl; // output: 260
+    delete[] arr;
+    return 0;
+}
+```
+
 ## About Multiple Definition
 In C++, a `class` or `struct` is often referenced by multiple `.cpp` source files. To avoid duplicating code in each file, we use header files (`.h`) and the `#include` directive. The `#include` directive essentially copies the contents of a header file into the current file during preprocessing.
 

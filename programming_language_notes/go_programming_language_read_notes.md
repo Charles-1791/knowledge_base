@@ -30,38 +30,43 @@ consider them as pointers
 - slice (not comparable)
 - map (not comparable)
 - function (not comparable)
-- channel (not comparable)
+- channel
 
 ### interface types
 - interface
 
-## string, []byte and []rune
+## string
+### string, []byte and []rune
+```golang
+type stringStruct struct {
+	str unsafe.Pointer
+	len int
+}
+```
+
 - `strings` are immutable. To modify a character within a `string`, you need to convert the `string` into a `[]rune`, make the modification, and then convert it back to a `string`.
 
-- Go strings follow the `UTF-8` standard, characters (`runes`) may be composed of multiple bytes. Therefore, the correct way to iterate over characters in a string is to convert it to a []rune and iterate over the runes.
+- Go strings follow the `UTF-8` standard, characters (`runes`, alias of `int32`) may be composed of multiple bytes. Therefore, the correct way to iterate over characters in a string is to convert it to a []rune and iterate over the runes.
 
 - Alternatively, a for loop over a string like `for _, r := range str` iterates rune by rune, not byte by byte, decoding `UTF-8` correctly.
 
 - Converting a string into a []rune allocates new memory. Since rune is fixed-lengthed, the size of the converted []rune is at least as large as the original string's byte length
 
-unsafe.Sizeof(x) returns a string's head size, which is 16 on a 64-bit system. Internally, a string in golang having the following structure:
-```golang
-type string struct {
-    Data *byte  // pointer to the actual UTF-8 bytes
-    Len  int    // length in bytes
-}
-```
+unsafe.Sizeof(x) returns a string's head size, which is 16 on a 64-bit system. 
 
 Converting a string to []byte also necessitates memory allocation, and so does the reverse.
 
+### Cost of String Comparison
+Recall that a string is effective a struct of an unsafe.Pointer to an array and a `len` field, if two strings shares the same unsafe.Pointer, then the runtime only needs to check the `len` to tell whether they are equal. The time complexity is O(1). However, if their underlying pointer are different, the comparison takes O(n) time.
+
 ## Array and Slice
 ### Slice
-- unsafe.Sizeof() returns a slice's head size, which is 24 on a 64-bit system. We may consider a slice like this:
+- unsafe.Sizeof() returns a slice's head size, which is 24 on a 64-bit system. The following is source code of the slice:
 ```golang
 type slice struct {
-    Data *T  // pointer to the underlying array
-    Len  int // number of elements
-    Cap  int // capacity of the array
+	array unsafe.Pointer
+	len   int
+	cap   int
 }
 ```
 - We can use T[]{idx1: ele1, idx2: ele2} to initialize a slice
@@ -76,85 +81,65 @@ This means that mutating elements of `Y` will also affect `X`, since they both r
 However, if you append to `Y` and the capacity of `Y` is exceeded, a new array is allocated and the existing elements are copied over. From that point on, `Y` refers to a different array, and further mutations no longer affect `X`.
 
 ```golang
-	X := []int{0,1,2,3,4,5,6,7,8}
-	fmt.Println(cap(X))
-	// output: 9
-	Y := X[3:5]
-	Y[0] = 300
-	Y = append(Y, 500)
-	Y = append(Y, 600)
-	Y = append(Y, 700)
-	Y = append(Y, 800)
-	fmt.Printf("X = %v\n", X)
-	// output: X = [0 1 2 300 4 500 600 700 800]
-	fmt.Printf("Y = %v\n", Y)
-	// output: Y = [300 4 500 600 700 800]
-	// now, Y points to a different piece of memory
-	Y = append(Y, 900)
-	Y[1] = 400
-	fmt.Printf("X = %v\n", X)
-	// output: X = [0 1 2 300 4 500 600 700 800]
-	fmt.Printf("Y = %v\n", Y)
-	// output: Y = [300 400 500 600 700 800 900]
+X := []int{0,1,2,3,4,5,6,7,8}
+fmt.Println(cap(X))
+// output: 9
+Y := X[3:5]
+Y[0] = 300
+Y = append(Y, 500)
+Y = append(Y, 600)
+Y = append(Y, 700)
+Y = append(Y, 800)
+fmt.Printf("X = %v\n", X)
+// output: X = [0 1 2 300 4 500 600 700 800]
+fmt.Printf("Y = %v\n", Y)
+// output: Y = [300 4 500 600 700 800]
+// now, Y points to a different piece of memory
+Y = append(Y, 900)
+Y[1] = 400
+fmt.Printf("X = %v\n", X)
+// output: X = [0 1 2 300 4 500 600 700 800]
+fmt.Printf("Y = %v\n", Y)
+// output: Y = [300 400 500 600 700 800 900]
 ```
 
-A slice allocates new memory when an element is appended beyond its current capacity. If the capacity is less than 1024, it typically grows by a factor of 2; for larger slices, the growth factor is around 1.5. However, according to my experiment, it is not the case.
+A slice allocates new memory when an element is appended beyond its current capacity. If the capacity is no greater than 1024, it typically grows by a factor of 2; for larger slices, the growth factor gradually decreases to 1.25. The following code is the source code computing the next capacity, minor adjustments are made to the result though.
 
 ```golang
-var test []int
-oldCap := cap(test)
-fmt.Printf("size = 0, capacity = %d\n", oldCap)
+// nextslicecap computes the next appropriate slice length.
+func nextslicecap(newLen, oldCap int) int {
+	newcap := oldCap
+	doublecap := newcap + newcap
+	if newLen > doublecap {
+		return newLen
+	}
 
-for i := 0; i < 100000000; i++ {
-    test = append(test, i)
-    if cap(test) != oldCap {
-        fmt.Printf("size = %d, capacity = %d, ratio is %.3f\n", i+1, cap(test), 1.0*float64(cap(test))/float64(oldCap))
-        oldCap = cap(test)
-    }
+	const threshold = 256
+	if oldCap < threshold {
+		return doublecap
+	}
+	for {
+		// Transition from growing 2x for small slices
+		// to growing 1.25x for large slices. This formula
+		// gives a smooth-ish transition between the two.
+		newcap += (newcap + 3*threshold) >> 2
+
+		// We need to check `newcap >= newLen` and whether `newcap` overflowed.
+		// newLen is guaranteed to be larger than zero, hence
+		// when newcap overflows then `uint(newcap) > uint(newLen)`.
+		// This allows to check for both with the same comparison.
+		if uint(newcap) >= uint(newLen) {
+			break
+		}
+	}
+
+	// Set newcap to the requested cap when
+	// the newcap calculation overflowed.
+	if newcap <= 0 {
+		return newLen
+	}
+	return newcap
 }
-```
-
-```
-size = 0, capacity = 0
-size = 1, capacity = 1, ratio is +Inf
-size = 2, capacity = 2, ratio is 2.000
-size = 3, capacity = 4, ratio is 2.000
-size = 5, capacity = 8, ratio is 2.000
-size = 9, capacity = 16, ratio is 2.000
-size = 17, capacity = 32, ratio is 2.000
-size = 33, capacity = 64, ratio is 2.000
-size = 65, capacity = 128, ratio is 2.000
-size = 129, capacity = 256, ratio is 2.000
-size = 257, capacity = 512, ratio is 2.000
-size = 513, capacity = 848, ratio is 1.656
-size = 849, capacity = 1280, ratio is 1.509
-size = 1281, capacity = 1792, ratio is 1.400
-size = 1793, capacity = 2560, ratio is 1.429
-size = 2561, capacity = 3408, ratio is 1.331
-size = 3409, capacity = 5120, ratio is 1.502
-size = 5121, capacity = 7168, ratio is 1.400
-size = 7169, capacity = 9216, ratio is 1.286
-size = 9217, capacity = 12288, ratio is 1.333
-size = 12289, capacity = 16384, ratio is 1.333
-size = 16385, capacity = 21504, ratio is 1.312
-size = 21505, capacity = 27648, ratio is 1.286
-size = 27649, capacity = 34816, ratio is 1.259
-size = 34817, capacity = 44032, ratio is 1.265
-size = 44033, capacity = 55296, ratio is 1.256
-size = 55297, capacity = 69632, ratio is 1.259
-size = 69633, capacity = 88064, ratio is 1.265
-size = 88065, capacity = 110592, ratio is 1.256
-size = 110593, capacity = 139264, ratio is 1.259
-size = 139265, capacity = 175104, ratio is 1.257
-size = 175105, capacity = 219136, ratio is 1.251
-size = 219137, capacity = 274432, ratio is 1.252
-size = 274433, capacity = 344064, ratio is 1.254
-size = 344065, capacity = 431104, ratio is 1.253
-size = 431105, capacity = 539648, ratio is 1.252
-size = 539649, capacity = 674816, ratio is 1.250
-size = 674817, capacity = 843776, ratio is 1.250
-size = 843777, capacity = 1055744, ratio is 1.251
-size = 1055745, capacity = 1319936, ratio is 1.250
 ```
 
 In comparison, the `vector` in C++ grows by 2x larger on my PC (x64, MacOS).
@@ -166,10 +151,90 @@ In comparison, the `vector` in C++ grows by 2x larger on my PC (x64, MacOS).
 
 - We can use == to compare two arrays but not slices
 
-- When an array is used as a function input parameter, the function **deep copy** the original array. So mutation to a copied array doesn't affect the original one. Use *[length]T instead if you intend to change the elements or avoid copy.
+- When an array is used as a function input parameter or for-ranged, the function **deep copy** the original array. So mutation to a copied array doesn't affect the original one. Use *[length]T instead if you intend to change the elements or avoid copy.
 
 ## Map
 Unlike in c++, we cannot take the address of a value inside a map because the map may rehash and invalidate the original pointer. This feature resembles the behavior of `unordered_map::iterator` in c++, which invalidate all previously returned iterators upon rehashing.
+
+Here is the source code:
+```golang
+// A header for a Go map.
+type hmap struct {
+	// Note: the format of the hmap is also encoded in cmd/compile/internal/reflectdata/reflect.go.
+	// Make sure this stays in sync with the compiler's definition.
+	count     int // # live cells == size of map.  Must be first (used by len() builtin)
+	flags     uint8
+	B         uint8  // log_2 of # of buckets (can hold up to loadFactor * 2^B items)
+	noverflow uint16 // approximate number of overflow buckets; see incrnoverflow for details
+	hash0     uint32 // hash seed
+
+	buckets    unsafe.Pointer // array of 2^B Buckets. may be nil if count==0.
+	oldbuckets unsafe.Pointer // previous bucket array of half the size, non-nil only when growing
+	nevacuate  uintptr        // progress counter for evacuation (buckets less than this have been evacuated)
+
+	extra *mapextra // optional fields
+}
+```
+
+## Slice VS Map pointer-property
+Conclusion, `Map` is in fact a pointer but slice is a struct containing a pointer member.
+
+Image there is a function taking in a slice, say `slc`, appending one element to it. After the function returns, the result of `len(slc)` is not incremented by 1. In contrast, if a function takes in a `map`, after inserting one element, the `len` returns the incremented value.
+
+```golang
+func appendToSlice(slc []int) {
+	slc = append(slc, 1)
+}
+
+func insertToMap(mp map[int]int) {
+	mp[1] = 1
+}
+
+func main() {
+    slc := make([]int, 0)
+	mp := make(map[int]int, 0)
+	fmt.Printf("before append, len(slc) = %d\n", len(slc))
+	fmt.Printf("before append, len(mp) = %d\n", len(mp))
+	fmt.Printf("--------- insert to slice and map ---------\n")
+	appendToSlice(slc)
+	insertToMap(mp)
+	fmt.Printf("after append, len(slc) = %d\n", len(slc))
+	fmt.Printf("after append, len(mp) = %d\n", len(mp))
+}
+```
+The execute result is:
+```text
+before append, len(slc) = 0
+before append, len(mp) = 0
+--------- insert to slice and map ---------
+after append, len(slc) = 0
+after append, len(mp) = 1
+```
+What causes such difference?
+
+Recall the internal representation of slice is:
+```golang
+type slice struct {
+	array unsafe.Pointer
+	len   int
+	cap   int
+}
+```
+When we create a slice, go runtime internally invokes this function:
+```golang
+func makeslice(et *_type, len, cap int) unsafe.Pointer 
+```
+which returns the starting address of the array. Then, the runtime builds the `slice` struct, fill in the len, cap and returns it. In short, what you actually gets is a struct. 
+
+When such struct is passed by value, all three members are copied into a new struct(as a function argument). Since `array` is itself an `unsafe.Pointer`, modification to its elements is visible outside the function. However, when appending an element into the slice, go runtime only modifies the `len` (and `cap`, if necessary) of the copied struct, leaving the original struct intact. As a result, when `len()` is called outside the function, the unchanged len is returned.
+
+In comparison, When we initialize a map, go runtime internally invokes:
+```golang
+func makemap(t *maptype, hint int, h *hmap) *hmap
+```
+So what you receive is a pointer to `hmap`. Modification to the map is achieved through pointer dereference, so the size field(in source code, the real name is "count") is changed.
+
+
 
 ## Struct
 The following form of struct initialization requires all fields to be provided in order:
@@ -192,8 +257,8 @@ Additionally:
 
 An unexported struct type in Go can be marshaled by json.Marshal only if the call occurs within the same package where the type is defined. In that case, reflection can access the exported fields and include them in the output. However, if the type is unexported and used from another package, its structure is hidden to reflection, and marshaling it will result in an empty JSON object ({}).
 
-## Closure pitfall's c++ counterpart
-Inside a for loop, using the iteration variable in a go routine or a callback function is a well-known pitfall. I happened to create a counterpart in c++ to help understand such phenomenon:
+## [Before Go 1.22] Closure pitfall's c++ counterpart
+BEFORE GO 1.22, inside a for loop, using the iteration variable in a go routine or a callback function is a well-known pitfall. GO 1.22 changed the semantics of iterator. I happened to create a counterpart in c++ to help understand such phenomenon:
 
 ```c++
 vector<string> temp = {"0","1","2","3","4","5"};
@@ -316,14 +381,14 @@ var  _ Foo = (*Bar)(nil)
 
 ## Interface
 ### Comparing two interface
-Two interface values `a` and `b` are comparable using == or != if:
+For two interface values `a` and `b`, a == b iff:
 - They hold the same dynamic type
 
-- The underlying dynamic values are comparable
+- The underlying dynamic values are comparable and equal to each other
 
 **Panic danger**:
 
-If the dynamic value is not comparable, comparing interfaces will panic at runtime. `Maps`, `slices`, and `functions` are not comparable. Comparing them directly using `==` or `!=` can be detected by compiler, but wrapping them in interfaces and comparing will panic.
+If the underlying dynamic value is not comparable, comparing two interfaces results in panic at runtime. To be more specific, `Maps`, `slices`, and `functions` are not comparable - doing so can be detected by compiler. However, by wrapping them in interfaces, comparison can bypass compiler's check, resulting in panic.
 
 ### Comparing with nil
 An interface has two component under the hood:
@@ -356,20 +421,67 @@ func main() {
 ```
 
 ### Costs of Using an Interface
-An interface in golang is two-word long, which is 16 bytes on a 64-bit machine. The first word stores a pointer to an internal structure containing the concrete type information and a method table. And the second pointer points to the address of the concrete instance.
+An interface in golang is two-word long, which is 16 bytes on a 64-bit machine. For a non-empty interface, that is, interface containing at least one function, the first word is a pointer to an internal structure, `ITab`, which contains the concrete type information and a method table. For an empty interface, the first word stores the dynamic type info.
 
-A method table in Go is similar to a virtual table (vtable) in C++ — it acts as a jump table that stores function pointers for each method declared in the interface. As a result, calling a method on an interface incurs more overhead than calling a concrete method directly. It involves dereferencing the interface's first word to access the `itab`, then using a fixed offset to fetch the appropriate function pointer from the method table, and finally performing an indirect call with the data pointer as the receiver.
+Regardless of its emptiness, the second pointer is always the address of the concrete instance.
 
 ```golang
-interface {
-    itab *itab     // pointer to interface-table
-    data *T        // pointer to concrete value
+type itab = abi.ITab
+/// ...
+type iface struct {
+	tab  *itab
+	data unsafe.Pointer
+}
+
+type eface struct {
+	_type *_type
+	data  unsafe.Pointer
 }
 ```
 
+The struct `ITab` has a method table member called `Fun`. A method table is similar to a virtual table (vtable) in C++ — it acts as a jump table that stores function pointers for each method declared in the interface. As a result, calling a method on an interface incurs more overhead than calling a concrete method directly. It involves dereferencing the interface's first word to access the `itab`, then using a fixed offset to fetch the appropriate function pointer from the method table `Fun`, and finally performing an indirect call with the data pointer as the receiver.
+
+```golang
+// The first word of every non-empty interface type contains an *ITab.
+// It records the underlying concrete type (Type), the interface type it
+// is implementing (Inter), and some ancillary information.
+//
+// allocated in non-garbage-collected memory
+type ITab struct {
+	Inter *InterfaceType
+	Type  *Type
+	Hash  uint32     // copy of Type.Hash. Used for type switches.
+	Fun   [1]uintptr // variable sized. fun[0]==0 means Type does not implement Inter.
+}
+```
+You may have noticed that the first pointer in ITab points to a interface type, and the second points to the dynamic concrete type. As a result, the ITab is shared for all {InterfaceType, ConcreteType} pair, which is not like in c++, where all instances of the same concrete class share the same vtable.
 
 ## Switch Clause
-In golang, a switch clause is like a multiple if-elseif-else: all the cases are evaluated in order, whereas in c++, where the switch key must be an integer or enum, compiler may build jump table or a binary search tree to achieve faster matching.
+In golang, a switch clause is like a multiple if-elseif-else: all the cases are evaluated in order, whereas in c++, where the switch key must be an integer or enum, compiler may build jump table or a binary search tree to achieve faster matching. The only exception is the position of "default", which can be put before or after any case clause while maintain the identical semantics. For instance, the following switch clauses are equivalent:
+
+```golang
+switch x {
+case 0:
+	// ...
+case 1:
+    // ...
+case 2:
+	// ...
+default:
+	// ...
+}
+
+switch x {
+case 0:
+	// ...
+default:
+	// ...
+case 1:
+    // ...
+case 2:
+	// ...
+}
+```
 
 The evaluate-cases-in-order feature demands extra attention to a type switch, where the key is an interface. 
 
@@ -403,7 +515,7 @@ outer: for {
 ## Blank Import
 Sometimes we see imports like this:
 ```golang
-_ "github.com/go-sql-driver/mysql"
+import _ "github.com/go-sql-driver/mysql"
 ```
 The purpose is to trigger an init() function defined inside that package, which usually initializes some variables or setup certain entries. For instance, in the `driver.go` of the `mysql` package, an entry is inserted into a global variable in `sql` package:
 ```golang
