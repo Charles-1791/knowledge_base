@@ -56,8 +56,57 @@ unsafe.Sizeof(x) returns a string's head size, which is 16 on a 64-bit system.
 
 Converting a string to []byte also necessitates memory allocation, and so does the reverse.
 
+### Converting a Byte Slice to String Without Memory Copy
+Suppose we have a slice of bytes named srcSlice. Normally, calling `string(srcSlice)` creates a copy of the underlying byte array. Using the unsafe package, we can avoid this copy.
+
+Approach 1: Using unsafe.SliceData
+```golang
+func byteSliceToString1(slc []byte) string {
+	arrStartAddr := unsafe.SliceData(slc)
+	ret := unsafe.String(arrStartAddr, len(slc))
+	return ret
+}
+```
+It is quite intuitive - `unsafe.SliceData` returns the start address of the slice’s underlying array. By combining it with the slice length, we construct a new string that shares the same memory as the original byte array.
+
+Approach 2: Reinterpreting the Slice Header
+The second approach is more "hacking" and more intriguing:
+```golang
+func byteSliceToString2(slc []byte) string {
+	sliceHeaderAddress := unsafe.Pointer(&slc)
+	ret := (*string)(sliceHeaderAddress)
+	return *ret
+}
+```
+We must be careful: taking the address of a slice is not the same as taking the address of its first element. Internally, the Go runtime represents a slice roughly as:
+```golang
+type slice struct {
+	array unsafe.Pointer
+	len   int
+	cap   int
+}
+```
+Taking the address of the slice returns the address of this struct, while taking the address of the first element is equivalent to `unsafe.SliceData(slc)`, which gives the value of the `array` field.
+
+So how does this second approach even work? It’s essentially a coincidence: the Go runtime represents strings in a very similar way:
+```golang
+type stringStruct struct {
+	str unsafe.Pointer
+	len int
+}
+```
+In other words, the first field is a pointer to the data, and the second is the length — just like a slice. Conceptually, this approach is like a reinterpret_cast in C++, treating a slice of bytes as a string directly.
+
+Warning: This approach relies on Go’s internal memory layout. Future versions of Go could break this.
+
+
+
+
 ### Cost of String Comparison
 Recall that a string is effective a struct of an unsafe.Pointer to an array and a `len` field, if two strings shares the same unsafe.Pointer, then the runtime only needs to check the `len` to tell whether they are equal. The time complexity is O(1). However, if their underlying pointer are different, the comparison takes O(n) time.
+
+### string assignment
+Assigning a string to another does not copy the underlying byte array. Instead, only the string header gets copied. In addition, since string in golang is immutable, there is Copy-On-Right semantics.
 
 ## Array and Slice
 ### Slice
@@ -281,8 +330,9 @@ A method with a non-pointer receiver wouldn't change the member of the struct in
 
 A method with pointer receiver cannot be called on a temporary object(a rvalue in c++).
 
-## Embedded struct
-When a struct(could also be a type) A is embedded in another struct B, its exported members, including variables and methods are *promoted* to B. It is a mistake to think it's *inheritance*, as we see in Java or C++. In fact, we should think that B *has-a* A, not *is-a* A. Trying to pass a pointer or instance of B as parameters where A is required cause compilation error:
+## Type embedding
+### From 30,000 feet
+Generally, when a struct(or a type) A is embedded in struct B, its members, namely variables and methods, are *promoted* to B. It is a mistake to consider this mechanism as *inheritance*. In stead, we should think that B *has-a* A, not *is-a* A. Trying to pass a pointer or instance of B as parameters where A is required cause compilation error:
 
 ```golang
 type foo struct {
@@ -304,8 +354,26 @@ func main() {
 }
 ```
 
+### Exported Members VS Unexported Members
+Let's say type A is embedded in struct B.
+- if A and B are in the same package, then all of A's methods and fields are promoted and visible to B.
+- otherwise, only exported members are visible to B.
+
+### Embedding A Pointer VS Embedding A Value
+1. Initialization difference:
+- Value embedding automatically creates the embedded value inside the struct — it’s always valid.
+- Pointer embedding doesn’t — the embedded pointer starts as nil.
+
+2. When do you embed a pointer
+- The embedded struct is large and you want to avoid copying it.
+- You want to share a single instance of the embedded type across multiple structs.
+- You want to optionally include behavior (e.g., lazy initialization). 
+
+
+
+
 ## Method Value VS Method Expression
-- Method value: var_name + "." + method_name. It "remembers" the receiver, so when such value is called, we don't need to input the variable name.
+- Method value: var_name + "." + method_name. It copies the receiver, so when such value is called, we don't need to input the variable name.
 
 - Method expression: struct_name + "." + method_name. When we call a method expression, we must send in a variable of that struct.
 
@@ -370,7 +438,7 @@ type Stringer interface {
 }
 ```
 
-## Forcing Inheritance
+## Forcing Implementation
 In golang, there is no key words like `extends` or `implements`, but we can use the following norm to ask compiler to check the inheritance relationship.
 
 Assuming we have a interface named Foo, and we need to force a struct Bar to satisfy it, we can write:
@@ -420,11 +488,7 @@ func main() {
 }
 ```
 
-### Costs of Using an Interface
-An interface in golang is two-word long, which is 16 bytes on a 64-bit machine. For a non-empty interface, that is, interface containing at least one function, the first word is a pointer to an internal structure, `ITab`, which contains the concrete type information and a method table. For an empty interface, the first word stores the dynamic type info.
-
-Regardless of its emptiness, the second pointer is always the address of the concrete instance.
-
+### Internal Implementation
 ```golang
 type itab = abi.ITab
 /// ...
@@ -438,8 +502,9 @@ type eface struct {
 	data  unsafe.Pointer
 }
 ```
+An interface in golang is two-word long, that is, 16 bytes on a 64-bit machine. For a non-empty interface, namely interface containing at least one function, the first word is a pointer to an internal structure, `ITab`, which generally contains the concrete type information and a method table. For an empty interface, the first word stores the dynamic type info.
 
-The struct `ITab` has a method table member called `Fun`. A method table is similar to a virtual table (vtable) in C++ — it acts as a jump table that stores function pointers for each method declared in the interface. As a result, calling a method on an interface incurs more overhead than calling a concrete method directly. It involves dereferencing the interface's first word to access the `itab`, then using a fixed offset to fetch the appropriate function pointer from the method table `Fun`, and finally performing an indirect call with the data pointer as the receiver.
+The second pointer is always an unsafe.Pointer of a copy of the dynamic value. For instance, if a struct implements an interface by defining methods with value receivers(in contrast to pointer receiver), then assigning an instance of such struct to that interface triggers copying of the whole struct.
 
 ```golang
 // The first word of every non-empty interface type contains an *ITab.
@@ -454,7 +519,32 @@ type ITab struct {
 	Fun   [1]uintptr // variable sized. fun[0]==0 means Type does not implement Inter.
 }
 ```
-You may have noticed that the first pointer in ITab points to a interface type, and the second points to the dynamic concrete type. As a result, the ITab is shared for all {InterfaceType, ConcreteType} pair, which is not like in c++, where all instances of the same concrete class share the same vtable.
+
+As shown above, in the struct `ITab`, there is a member called `Fun`, which serves as a method jump table. Like a virtual table (vtable) in C++, it holds function pointers corresponding to methods defined by the interface. 
+
+When a method is invoked through an interface, the `tab` field is dereferenced. Since method dispatch is essentially an indexed lookup, the runtime retrieves the appropriate function pointer from Fun at a fixed offset, and then performs an indirect call.
+
+You may have noticed that there is no need to create an `ITab` for each instance. For a specific pair of {InterfaceType, ConcreteType}, the `ITab` is shared among all instances, in that once the interface type and concrete type are fixed, the function table is determined. 
+
+Go runtime achieves this by storing the [hash(itype, ctype), *itab] mapping in a global map, which is not like in c++, where all instances of the same concrete class share the same vtable.
+
+```golang
+const itabInitSize = 512
+
+var (
+	itabLock      mutex                               // lock for accessing itab table
+	itabTable     = &itabTableInit                    // pointer to current table
+	itabTableInit = itabTableType{size: itabInitSize} // starter table
+)
+
+// Note: change the formula in the mallocgc call in itabAdd if you change these fields.
+type itabTableType struct {
+	size    uintptr             // length of entries array. Always a power of 2.
+	count   uintptr             // current number of filled entries.
+	entries [itabInitSize]*itab // really [size] large
+}
+```
+
 
 ## Switch Clause
 In golang, a switch clause is like a multiple if-elseif-else: all the cases are evaluated in order, whereas in c++, where the switch key must be an integer or enum, compiler may build jump table or a binary search tree to achieve faster matching. The only exception is the position of "default", which can be put before or after any case clause while maintain the identical semantics. For instance, the following switch clauses are equivalent:
@@ -612,7 +702,7 @@ type Phone struct {
 }
 
 func (ph *Phone) Call(callAt time.Duration) {
-	fmt.Printf("%s made at phone call at %v", ph.Owner, callAt)
+	fmt.Printf("%s made a phone call at %v", ph.Owner, callAt)
 }
 
 func TestMethodType(t *testing.T) {
@@ -635,7 +725,7 @@ func TestMethodType(t *testing.T) {
 | reflect.Value.Method(i) | reflect.Value | YES | NO | First Parameter in Signature |
 | reflect.Type.Method(i) | reflect.Method | NO | YES | Method Receiver |
 
-## Unsafe
+## Unsafe Pointer
 ### Converting unsafe.Pointer to uintptr is hazardous
 #### GC may move stack allocated object
 
@@ -643,11 +733,37 @@ Go uses a `non-moving` garbage collector for heap-allocated objects, which guara
 
 Go's stacks are small at first (typically 2 KB) and can grow. When this happens, variables on the stack may be moved to a new memory region. Normally, Go tracks and adjusts all legitimate pointers — including unsafe.Pointer — so they remain valid after a stack move.
 
-But once a uintptr is used to store an address (converted from unsafe.Pointer), the GC no longer tracks it as a pointer. From the GC’s perspective, it's just a number. If the original object is moved (e.g., due to stack growth), the value stored in uintptr becomes stale and invalid, potentially leading to undefined behavior.
+But once a uintptr is used to store an address (converted from unsafe.Pointer), the GC no longer tracks it as a pointer. From the GC’s perspective, it's just an integer. If the original object is moved (e.g., due to stack growth), the value stored in uintptr becomes stale and invalid, potentially leading to undefined behavior.
 
 #### GC may recycle the heap or stack allocated object
-
-Another risk arises when you convert an unsafe.Pointer to a uintptr and the original pointer is no longer referenced. Because uintptr is not considered a pointer, the garbage collector may reclaim the memory that the original pointer referred to — even though you still have the address stored in uintptr.
+Another risk arises when you convert an unsafe.Pointer to a uintptr and the original pointer is no longer referenced. Because uintptr is not considered a pointer, the garbage collector may reclaim the memory that the original pointer referred to — even though you still have the address value stored in uintptr.
 
 As a result, dereferencing that address can lead to accessing freed or repurposed memory — a classic use-after-free scenario.
 
+
+## Initialization order
+- imported packaged
+- global variables 
+- init() functions
+
+## MPG model
+- `M` stands for OS-threads. It has nothing to do with level of parallelism. You may consider it as a worker.
+
+- `P` stands for logical Processors. Its value is determined by `GOMAXPROCS`. Each logical processor owns a run queue of goroutines, which is generally scheduled FIFO. A goroutine has a maximum 10 ms duration before getting preempted.
+
+- `G` stands for goroutines. 
+
+### More about Goroutine
+- maintained and scheduled by go runtime
+- light-weighted, 2KB stack each
+- each program always starts from the main goroutine, and when such goroutine exits, the program exits regardless of any other goroutine
+- when a panic is not recovered, only the specific goroutine ends; others remain unaffected. (in contrast to c++'s thread::terminate()).
+
+### work stealing
+You may think in this way: there is an advanced thread pool enabling task stealing. Such pool holds `GOMAXPROCS` threads, meaning that at most this number of threads can run in parallel. Each thread has its own `thread_local` task queue. Each thread takes a task from its own queue for execution. When such queue is empty, the thread may randomly select a victim thread, from which it steals half the tasks.
+
+### advantages over os-level thread
+1. light-weighted: the default stack size of a goroutine is 2KB, but for an os thread, it's 8MB (linux, macos) or 1MB(windows).
+2. lower creation cost
+3. cheaper context switching cost: it is done by go runtime, do not need to switch between kernel state and user state.
+4. M:N scheduling: a single P manages multiple goroutines
