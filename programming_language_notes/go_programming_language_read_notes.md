@@ -99,9 +99,6 @@ In other words, the first field is a pointer to the data, and the second is the 
 
 Warning: This approach relies on Go’s internal memory layout. Future versions of Go could break this.
 
-
-
-
 ### Cost of String Comparison
 Recall that a string is effective a struct of an unsafe.Pointer to an array and a `len` field, if two strings shares the same unsafe.Pointer, then the runtime only needs to check the `len` to tell whether they are equal. The time complexity is O(1). However, if their underlying pointer are different, the comparison takes O(n) time.
 
@@ -755,7 +752,20 @@ As a result, dereferencing that address can lead to accessing freed or repurpose
 
 ### More about Goroutine
 - maintained and scheduled by go runtime
-- light-weighted, 2KB stack each
+- light-weighted, 2KB stack each intially. Can grow up to 512MB if necessary. About 512MB: the source code in fact defines that the largest stack size must be 1e9 bytes:
+```golang
+// runtime/proc.go
+// Max stack size is 1 GB on 64-bit, 250 MB on 32-bit.
+// Using decimal instead of binary GB and MB because
+// they look nicer in the stack overflow failure message.
+if goarch.PtrSize == 8 {
+	maxstacksize = 1000000000
+} else {
+	maxstacksize = 250000000
+}
+```
+However, the stack always grows by doubling its original size, so the size of a stack grows by powers of two. Since the largest power of two less than 1e9 is 512MB, the real stack limit is 512 MB.
+
 - each program always starts from the main goroutine, and when such goroutine exits, the program exits regardless of any other goroutine
 - when a panic is not recovered, only the specific goroutine ends; others remain unaffected. (in contrast to c++'s thread::terminate()).
 
