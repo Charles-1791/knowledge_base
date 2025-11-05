@@ -777,3 +777,5 @@ You may think in this way: there is an advanced thread pool enabling task steali
 2. lower creation cost
 3. cheaper context switching cost: it is done by go runtime, do not need to switch between kernel state and user state.
 4. M:N scheduling: a single P manages multiple goroutines
+
+

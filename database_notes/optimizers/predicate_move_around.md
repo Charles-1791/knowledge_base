@@ -2,7 +2,9 @@
 ## TL;DR
 predicate move around = predicate pull up + predicate transition + predicate push down
 ## Introduction
+
 ### Classic Predicate Transition
+
 Based on given predicates, the database can deduce additional ones to optimize query execution. For example, consider the query:
 ```SQL
 SELECT *
@@ -353,7 +355,9 @@ During pull up phase, the arithmetic relations among survivors are retained sinc
 
 When we do push down, any conditions involving `newcomers` — i.e., expressions not present in the GROUP BY — must remain above the `Aggregation`. This differs from `Projection`, where `newcomers` can always be substitute by expressions containing only `survivors`, enabling further push down. In contrast, `newcomers` in `Aggregation` involve aggregate functions, which cannot be pushed below the aggregation node.
 
-#### 
+#### Join
+
+
 
 
 
