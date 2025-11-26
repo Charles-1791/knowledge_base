@@ -164,7 +164,7 @@ for _, casei := range lockorder {
 
 You may have noticed that race condition may occur when two channels attempt to wake up the same blocked select concurrently. Go runtime solves this with an atomic variable stored in the goroutine’s g structure, named `selectDone`.  
 
-When a channel operation tries to remove a goroutine from its waiting queue, it first checks whether the goroutine is currently participating in a select.
+When a channel tries to take off a goroutine from its waiting queue, it first checks whether the goroutine is currently participating in a select.
 
 If so, it attempts to atomically set selectDone from 0 to 1 using a compare-and-swap (CAS)
 
@@ -219,7 +219,6 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 }
 
 ```
-
 
 
 

@@ -19,10 +19,9 @@ An optimized plan is then converted into an execution plan, which is finally use
 ## Logical Plan
 A Logical Plan has a tree structure, where data is generated at the leaf node and flows to the root. 
 
-<img src="../images/logical_plan_example.jpg" alt="Plan Tree" width="30%"/>
+<img src="../images/logical_plan_example.jpg" alt="Plan Tree" width="40%"/>
 
 Data received by a non-leaf node usually undergoes some modification before being transferred to another node, including filtering out unwanted rows(Selection), removing or adding extra columns(Projection), matching rows between two children(Join), etc. 
 
 In this way, data moves from below to above and is returned to the client at root node. The whole process is similar to magma rises to the surface during volcanic eruption.
-
 
